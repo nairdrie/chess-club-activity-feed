@@ -1,0 +1,176 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Chess.com Club Activity Feed — full working demo topology.
+#
+#   web ─┐
+#        ├─ lb (nginx, sticky WS) ─┬─ api1, api2        (stateless REST)
+#        │                         └─ rt1, rt2, rt3     (socket.io pods)
+#   loadgen (tools profile)
+#
+#   pipeline:  API ─XADD▶ stream:ingest ─drain▶ MySQL(events+outbox)
+#              ─relay▶ stream:events ─fanout▶ Dynamo(feed) + realtime + stream:notify
+#              ─notify▶ deliver (deduped)
+#
+#   infra: redis (streams/cache/dedupe), mysql (durable + outbox), dynamodb-local (feed store)
+#
+# Scale anything:  docker compose up -d --scale fanout=3 --scale api1=1
+# (api/rt are explicit services so the LB config stays legible; workers scale freely.)
+# ─────────────────────────────────────────────────────────────────────────
+
+x-backend: &backend
+  build: ./server
+  restart: unless-stopped
+  environment: &backend-env
+    REDIS_URL: redis://redis:6379
+    MYSQL_HOST: mysql
+    MYSQL_PORT: "3306"
+    MYSQL_USER: feed
+    MYSQL_PASSWORD: feedpw
+    MYSQL_DATABASE: activity
+    DYNAMO_ENDPOINT: http://dynamodb:8000
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: local
+    AWS_SECRET_ACCESS_KEY: local
+    PUSH_THRESHOLD: ${PUSH_THRESHOLD:-5000}
+    ACTIVE_DAYS: ${ACTIVE_DAYS:-7}
+    ACTIVE_SAMPLE: ${ACTIVE_SAMPLE:-50}
+    WHALE_MEMBERS: ${WHALE_MEMBERS:-500000}
+    SMALL_MEMBERS: ${SMALL_MEMBERS:-1200}
+    DRAIN_BATCH: ${DRAIN_BATCH:-256}
+    RELAY_BATCH: ${RELAY_BATCH:-256}
+    RELAY_POLL_MS: ${RELAY_POLL_MS:-50}
+    PORT: "8080"
+  depends_on:
+    redis: { condition: service_healthy }
+    mysql: { condition: service_healthy }
+    dynamodb: { condition: service_started }
+    seed: { condition: service_completed_successfully }
+
+services:
+  # ── infra ──────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    # noeviction: the dedupe/idempotency instance must never LRU-evict keys,
+    # or exactly-once could regress into duplicate pushes.
+    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: activity
+      MYSQL_USER: feed
+      MYSQL_PASSWORD: feedpw
+    ports: ["3306:3306"]
+    volumes: ["mysql_data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["8000:8000"]
+
+  # ── one-shot seed (clubs, memberships, active sets, feed history) ────────
+  seed:
+    <<: *backend
+    restart: "no"
+    command: ["npm", "run", "seed"]
+    environment:
+      <<: *backend-env
+      ROLE: seed
+    depends_on:
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+      dynamodb: { condition: service_started }
+
+  # ── API replicas (stateless) ─────────────────────────────────────────────
+  api1:
+    <<: *backend
+    command: ["npm", "run", "api"]
+    environment: { <<: *backend-env, ROLE: api }
+  api2:
+    <<: *backend
+    command: ["npm", "run", "api"]
+    environment: { <<: *backend-env, ROLE: api }
+
+  # ── realtime pods (socket.io + redis adapter) ────────────────────────────
+  rt1:
+    <<: *backend
+    command: ["npm", "run", "realtime"]
+    environment: { <<: *backend-env, ROLE: realtime }
+    depends_on:
+      redis: { condition: service_healthy }
+  rt2:
+    <<: *backend
+    command: ["npm", "run", "realtime"]
+    environment: { <<: *backend-env, ROLE: realtime }
+    depends_on:
+      redis: { condition: service_healthy }
+  rt3:
+    <<: *backend
+    command: ["npm", "run", "realtime"]
+    environment: { <<: *backend-env, ROLE: realtime }
+    depends_on:
+      redis: { condition: service_healthy }
+
+  # ── workers (scale each independently) ───────────────────────────────────
+  drain:
+    <<: *backend
+    command: ["npm", "run", "worker:drain"]
+    environment: { <<: *backend-env, ROLE: drain }
+  relay:
+    <<: *backend
+    command: ["npm", "run", "worker:relay"]
+    environment: { <<: *backend-env, ROLE: relay }
+  fanout:
+    <<: *backend
+    command: ["npm", "run", "worker:fanout"]
+    environment: { <<: *backend-env, ROLE: fanout }
+  notify:
+    <<: *backend
+    command: ["npm", "run", "worker:notify"]
+    environment: { <<: *backend-env, ROLE: notify }
+
+  # ── frontend + edge ──────────────────────────────────────────────────────
+  web:
+    build: ./web
+    restart: unless-stopped
+
+  lb:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./infra/nginx/lb.conf:/etc/nginx/conf.d/default.conf:ro
+    ports: ["8080:80"]
+    depends_on: [api1, api2, rt1, rt2, rt3, web]
+
+  # ── load generator (run on demand) ───────────────────────────────────────
+  # docker compose run --rm loadgen   (or: make load RATE=5000 SECONDS=30 CLUB=whale)
+  loadgen:
+    <<: *backend
+    restart: "no"
+    profiles: ["tools"]
+    command: ["npm", "run", "loadgen"]
+    environment:
+      <<: *backend-env
+      ROLE: loadgen
+      TARGET_HTTP: http://lb
+      TARGET_WS: http://lb
+      API_PREFIX: /api
+      LOAD_RATE: ${LOAD_RATE:-2000}
+      LOAD_SECONDS: ${LOAD_SECONDS:-20}
+      LOAD_CLUB: ${LOAD_CLUB:-whale}
+    depends_on: [lb]
+
+volumes:
+  mysql_data:
