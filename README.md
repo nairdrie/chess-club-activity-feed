@@ -17,6 +17,10 @@ under load**.
 > DynamoDB-local→ScyllaDB). Those annotations are in [§ Swaps at scale](#swaps-at-scale) —
 > they're the interview cheat sheet.
 
+> 📄 **The one-page design deliverable is [`DESIGN.md`](./DESIGN.md)** — component
+> diagram, sequence flow, API sketch (OpenAPI + Protobuf), frontend note, AI-agent
+> note. This README is the deep-dive / run guide behind it.
+
 ---
 
 ## TL;DR — run it
@@ -212,6 +216,19 @@ actually firing under redelivery). The same counters render live in the UI's
 make load RATE=8000 SECONDS=30 CLUB=whale   # whale = PULL path
 make load RATE=3000 SECONDS=20 CLUB=small   # small = PUSH path
 ```
+
+### What's proven vs. what scales to target
+
+Be precise about the claim: this demo **proves the mechanism and the guarantees**
+— zero loss, zero duplication, spike absorbed by the buffer, latency dropping as
+workers scale — not the literal 20k/s number. A single load-generator process
+tops out around ~1k/s (Node `fetch` client-side, not a pipeline limit). The
+**5k/s-avg, 20k/s-peak targets are met by design**: partition the log by
+`club_id`, run the ingest/drain/fanout/notify workers and socket.io pods at N
+replicas (the consumer groups split the load), and swap Redis Streams → Kafka and
+DynamoDB → ScyllaDB for the throughput/retention headroom. To push higher load
+locally, run several load generators in parallel or `--scale` the workers — you'll
+watch buffer depth rise and drain while duplicates/lost stay at 0.
 
 ---
 
