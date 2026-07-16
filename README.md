@@ -65,7 +65,7 @@ flowchart TB
   LB --> API[API replicas x2]
   LB --> RT[socket.io pods x3]
 
-  API -->|XADD O(1), return now| INGEST[(Redis Stream: ingest)]
+  API -->|XADD, returns now| INGEST[(Redis Stream: ingest)]
   INGEST -->|batch| DRAIN[drain worker]
   DRAIN -->|1 tx: domain + outbox| MYSQL[(MySQL: events + outbox)]
   MYSQL -->|poll FOR UPDATE SKIP LOCKED| RELAY[relay worker]
@@ -107,7 +107,7 @@ sequenceDiagram
   API->>IB: XADD (O(1))
   API-->>C: 202 {eventId}   # returns immediately, never touches DB
   IB->>D: XREADGROUP (batch)
-  D->>DB: BEGIN; INSERT event; INSERT outbox; COMMIT
+  D->>DB: tx — INSERT event + INSERT outbox, COMMIT
   D-->>IB: XACK  # only after durable write (no loss window)
   R->>DB: SELECT ... FOR UPDATE SKIP LOCKED
   R->>EV: XADD (publish)
