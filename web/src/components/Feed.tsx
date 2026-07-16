@@ -41,20 +41,32 @@ export function Feed({
     return () => window.clearInterval(id);
   }, []);
 
+  // Always call the latest loadMore without making it an effect dependency
+  // (its identity churns as hasMore/loadingMore change).
+  const loadMoreRef = useRef(loadMore);
+  loadMoreRef.current = loadMore;
+
+  // The sentinel only exists once the real list is rendered (not during
+  // skeletons / empty / error). Re-attach when that becomes true AND after each
+  // append (items.length changes) so chained loading continues while the
+  // sentinel stays in view.
+  const listMounted = !loadingInitial && !error && items.length > 0;
+
   // Infinite scroll via IntersectionObserver on a bottom sentinel.
   useEffect(() => {
+    if (!listMounted) return;
     const root = scrollRef.current;
     const sentinel = sentinelRef.current;
     if (!root || !sentinel) return;
     const obs = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) loadMore();
+        if (entries.some((e) => e.isIntersecting)) loadMoreRef.current();
       },
       { root, rootMargin: '300px 0px' }
     );
     obs.observe(sentinel);
     return () => obs.disconnect();
-  }, [loadMore]);
+  }, [listMounted, items.length]);
 
   const onScroll = () => {
     const el = scrollRef.current;

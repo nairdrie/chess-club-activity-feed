@@ -11,6 +11,9 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8080',
         changeOrigin: true,
+        // The API serves routes at root (/feed, /events…); the /api prefix is a
+        // routing namespace the edge LB strips. Mirror that in dev.
+        rewrite: (p) => p.replace(/^\/api/, ''),
       },
       '/socket.io': {
         target: 'http://localhost:8080',
