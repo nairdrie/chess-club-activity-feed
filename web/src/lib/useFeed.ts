@@ -148,7 +148,11 @@ export function useFeed(): UseFeed {
         socket.on('activity', (payload: ActivityPayload) => {
           // (a) observability: delivered / duplicates / latency
           const now = Date.now();
-          const latency = now - payload.createdAt;
+          // e2e latency crosses two clocks (server stamps createdAt, browser
+          // stamps receipt). Host/container clock skew can make idle latencies
+          // slightly negative; clamp to 0 so sub-skew values read as ~instant.
+          // Under load (hundreds of ms+) the skew is negligible.
+          const latency = Math.max(0, now - payload.createdAt);
           latencySamples.current.push(latency);
           if (latencySamples.current.length > 200) {
             latencySamples.current.shift();
