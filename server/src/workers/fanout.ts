@@ -90,6 +90,17 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
     const kind = classifyKind(ev.memberCount);
     const item = toFeedItem(ev, kind);
 
+    // ALWAYS append to club_timeline — the complete, authoritative per-club log.
+    // This is what makes the active-set optimization SOUND: any feed we skip
+    // materializing (inactive users, whales) is reconstructable from here, so no
+    // member ever loses an event. (Also closes the threshold-crossing gap.)
+    timelineRows.push(clubTimelineRow(item));
+    timelineWrites += 1;
+
+    // PUSH clubs ADDITIONALLY materialize into active members' user_feed — a
+    // hot cache / fast path (single-partition read) for users who are around.
+    // Inactive members are intentionally skipped; they get rebuilt from the
+    // timeline on return.
     if (kind === 'push') {
       for (const uid of members) {
         userFeedRows.push(userFeedRow(uid, item));
@@ -97,9 +108,6 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
         cachePipe.zremrangebyrank(feedCache(uid), 0, -(config.userFeedCap + 1));
       }
       materialized += members.length;
-    } else {
-      timelineRows.push(clubTimelineRow(item));
-      timelineWrites += 1;
     }
 
     const thin: ThinPayload = { eventId: ev.id, cursor: ev.id, clubId: ev.clubId, type: ev.type, createdAt: ev.createdAt };

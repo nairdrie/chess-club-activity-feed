@@ -88,8 +88,10 @@ async function seedHistory(cs: Club[]): Promise<void> {
         createdAt: ts,
         via: c.kind,
       };
+      // club_timeline is authoritative for every club; push clubs also
+      // materialize the active members' user_feed (matches the fanout worker).
+      await putTimeline(item);
       if (c.kind === 'push') await batchPutUserFeed(members, item);
-      else await putTimeline(item);
       n++;
     }
   }

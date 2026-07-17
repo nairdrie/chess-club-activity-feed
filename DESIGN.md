@@ -8,11 +8,15 @@ in O(1) and the request returns immediately (never touches the DB on the write
 path — the spike absorber). A **drain** worker persists each event with its
 **outbox row in one MySQL transaction**, ACKing the buffer only after commit
 (no loss window). A **relay** polls the outbox (`FOR UPDATE SKIP LOCKED`) and
-publishes to the event log. A **fanout** worker then splits on club size:
-**push** (materialize per-user feeds) for small clubs, **pull** (one append to a
-day-bucketed club timeline, merged at read time) for whale clubs up to 500k —
-and only ever touches users **active in the last N days** (a Redis set
-intersection). It pushes a **thin realtime payload** (id + cursor) to the club's
+publishes to the event log. A **fanout** worker then always appends the event to
+a day-bucketed **`club_timeline`** — the complete, authoritative per-club log —
+and, for **small (push) clubs**, *additionally* materializes it into the
+**`user_feed`** of members **active in the last N days** (a Redis set
+intersection) as a hot read cache. Whale (pull) clubs and inactive members are
+never materialized; the read path **merges each club's timeline** to reconstruct
+them, so no member ever misses an event (this also makes threshold-crossing
+safe). `user_feed` is thus a rebuildable cache; `club_timeline`/`events` are the
+truth. Fanout also pushes a **thin realtime payload** (id + cursor) to the club's
 socket room and enqueues **preference-filtered** notifications, deduplicated
 exactly-once at the sink by a conditional write on `(user, event, channel)`.
 
@@ -34,16 +38,19 @@ flowchart TB
   MYSQL -->|poll FOR UPDATE SKIP LOCKED| RELAY[relay worker]
   RELAY -->|publish, key=club_id| EVENTS[(Redis Stream: events -- Kafka at scale)]
   EVENTS --> FANOUT[fanout worker]
-  FANOUT -->|push: materialize active members| UFEED[(user_feed -- Dynamo/Scylla)]
-  FANOUT -->|pull: 1 append| CTL[(club_timeline -- Dynamo/Scylla)]
+  FANOUT -->|always: 1 append per club| CTL[(club_timeline -- authoritative log)]
+  FANOUT -->|push clubs: materialize active members| UFEED[(user_feed -- active cache)]
   FANOUT -->|thin payload| RT
   RT -->|activity id+cursor| UI
-  FANOUT -->|preference filter| NOTIFY[(Redis Stream: notify)]
+  FANOUT -->|preference filter, then coalesce| DIGEST[(Redis: per-user digest counters)]
+  FANOUT -.->|high-priority: immediate| NOTIFY[(Redis Stream: notify)]
+  DIGEST --> SCHED[digest scheduler -- per window]
+  SCHED -->|N new in club summary| NOTIFY
   NOTIFY --> NW[notify worker]
   NW -->|conditional-write dedupe| DDQ[(notify_dedupe)]
   NW -.->|on failure| DLQ[(DLQ)]
-  API -->|read: merge push + pull| UFEED
-  API --> CTL
+  API -->|read: fast path| UFEED
+  API -->|read: merge for completeness| CTL
   CACHE[(Redis ZSET hot pages)] --- API
 ```
 
@@ -61,6 +68,8 @@ sequenceDiagram
   participant F as fanout
   participant FS as feed store
   participant RT as socket.io
+  participant DG as digest counters
+  participant SCH as digest sched
   participant N as notify
   C->>API: POST /events {clubId,type}
   API->>IB: XADD
@@ -71,19 +80,36 @@ sequenceDiagram
   R->>DB: SELECT ... FOR UPDATE SKIP LOCKED
   R->>EV: publish
   EV->>F: XREADGROUP
-  alt club <= threshold (PUSH)
-    F->>FS: batch write user_feed (active only)
-  else whale (PULL)
-    F->>FS: 1 append club_timeline
+  F->>FS: 1 append club_timeline (always -- authoritative log)
+  opt club <= threshold (PUSH)
+    F->>FS: materialize user_feed (active members -- hot cache)
   end
   F->>RT: emit thin {eventId,cursor}
   RT-->>C: activity
   C->>API: GET /feed?after=cursor
-  API-->>C: full items (push+pull merged)
-  F->>N: enqueue (preference-filtered)
-  N->>FS: conditional write (user,event,channel)
+  API-->>C: user_feed fast path + club_timeline merge (complete)
+  F->>DG: preference filter, then coalesce -- HINCRBY digest per user+club
+  Note over DG: many events collapse to one counter per user/club/window
+  SCH->>DG: each window -- read and reset counters
+  SCH->>N: one digest -- "N new in {club}"
+  N->>FS: conditional write (user, club, window)
   N-->>N: deliver once / dedupe / DLQ
 ```
+
+## Notification fan-out & digesting
+
+Notifications target **preference-enabled members** (not just active users — push/email
+exist to reach people who are away), which for a busy whale is a huge fan-out. Two
+reducers keep it sane. **Preference filter** (in fanout) drops muted clubs / disabled
+channels before anything is enqueued. **Digesting** then collapses volume by *time* rather
+than by dropping recipients: instead of one notification per event, fanout does an O(1)
+`HINCRBY digest:{user}:{club}` into a per-user counter, and a **digest scheduler** flushes
+each window (e.g. hourly) into a single summary — *"50 new activities in Team USA"* — so
+notification volume becomes **users × windows**, not **users × events**. High-priority
+event types (e.g. a match start) can bypass the digest for immediate delivery. Each digest
+is keyed `(user, club, window)`, so the same exactly-once conditional-write dedupe + DLQ
+applies — a window is delivered once or not at all. In-app is a live badge count off the
+same counter; push/email are the digested channels.
 
 ## API sketch
 

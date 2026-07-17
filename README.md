@@ -138,24 +138,40 @@ sequenceDiagram
 ### 1. Whale-club path first — push vs pull
 The easy case is **push**: materialize a copy of the event into every member's
 `user_feed`. That's fine for small clubs but catastrophic for a 500k-member whale
-(one event → 500k writes). So the fanout worker branches on club size
-(`PUSH_THRESHOLD`, default 5k):
+(one event → 500k writes). So the fanout worker (`server/src/workers/fanout.ts`):
 
-- **PUSH** (`memberCount <= threshold`): materialize per-user rows in `user_feed`.
-  Reads are a single-partition query. → `server/src/workers/fanout.ts`
-- **PULL** (whale): **one** append to `club_timeline` (day-bucketed). Readers
-  **merge the timeline at read time**. → `server/src/api/feed.ts` (`getFeedPage`)
+- **always** appends **one** row to `club_timeline` (day-bucketed) — the
+  **complete, authoritative per-club log**.
+- **additionally**, for **PUSH** clubs (`memberCount <= PUSH_THRESHOLD`, default 5k),
+  materializes per-user rows into the `user_feed` of **active** members — a hot
+  read cache giving a single-partition read.
+- **PULL** (whale) clubs are never materialized; readers merge the timeline.
 
-The read path unifies both into one ULID-sorted page and tags each row `via: push`
-/ `via: pull` — the UI shows the provenance pill so you can *see* which path served
-each row.
+The read path (`getFeedPage`) reads `user_feed` (fast path) **and merges each
+club's `club_timeline`** for completeness, deduping with the materialized copy
+winning. It tags each row `via: push` (served from the cache) or `via: pull`
+(reconstructed from the timeline) — the UI provenance pill shows which.
 
-### 2. Only touch active users — the highest-ROI optimization
-Even push, and all notifications, only fan out to **users active in the last N
-days** — a single Redis set intersection (`SINTER club:{id}:members active:users`).
-For a whale this collapses 500k → the active few. See `activeMembersOf()` in
+**Why always write the timeline?** It's what makes the active-set optimization
+(next) *sound*: any feed we skip materializing — inactive members, whale clubs —
+is reconstructable from the timeline, so **no member ever misses an event**. It
+also closes the threshold-crossing gap (a club growing past 5k). `user_feed` is a
+rebuildable cache; `club_timeline` + `events` are the truth.
+
+### 2. Only *materialize* active users — the highest-ROI optimization
+Feed **materialization** only touches **users active in the last N days** — a
+single Redis set intersection (`SINTER club:{id}:members active:users`). For a
+whale this collapses 500k → the active few. This is sound *because* the timeline
+is the complete log (decision #1): inactive users are reconstructed on return, so
+skipping their materialization never loses data. See `activeMembersOf()` in
 `fanout.ts`. (`ACTIVE_SAMPLE` sizes this set in the demo so a laptop can run a
 "500k" club; the *code path* is exactly the production one.)
+
+Note the demo also gates *notifications* on the active set for simplicity — but
+that's a conflation: push/email exist to reach **inactive** users, so
+notifications should target **preference-enabled** members regardless of activity,
+with **digesting** to bound volume (see decision #5). Feed materialization =
+active-gated; notifications = preference-gated.
 
 ### 3. The spike absorber — never touch the DB on the request path
 `POST /events` does an O(1) `XADD` to `stream:ingest` and returns immediately
@@ -183,6 +199,14 @@ Two independent safety nets:
   from at-least-once upstream can never produce a duplicate notification.
 - **Separate consumer group + DLQ** so notification delivery failures never block
   the feed path.
+- **Digesting bounds the fan-out** (design; not in the demo code). Rather than one
+  notification per event, fanout does an O(1) `HINCRBY digest:{user}:{club}` and a
+  **digest scheduler** flushes each window into a single summary — *"50 new
+  activities in Team USA"* — so volume is **users × windows**, not **users ×
+  events**. High-priority event types bypass for immediate delivery; each digest is
+  keyed `(user, club, window)` so the same dedupe + DLQ apply. This is how
+  notifications can reach *all* preference-enabled members (incl. inactive) without
+  spamming. See `DESIGN.md` for the diagrams.
 
 ### 6. Realtime — thin payload, client backfills
 Fanout pushes only `{eventId, cursor, clubId, createdAt}` to the club room (via

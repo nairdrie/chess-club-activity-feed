@@ -23,22 +23,27 @@ interface Opts {
 export async function getFeedPage(userId: string, opts: Opts): Promise<FeedPage> {
   const { limit, before, after } = opts;
   const clubs = await getUserClubs(userId);
-  const pullClubs = clubs.filter((c) => c.kind === 'pull');
 
   const pageOpts = { limit, before, after };
 
-  // PUSH: single materialized-feed query (already tagged via='push' at write time,
-  // but we defensively set it here too).
+  // FAST PATH — the user's materialized feed (push clubs, active users). One
+  // single-partition query returns all their push-club items pre-merged.
   const pushRows = (await queryUserFeed(userId, pageOpts)).map((i) => ({ ...i, via: 'push' as const }));
 
-  // PULL: merge each whale club's timeline at read time.
-  const pullResults = await Promise.all(
-    pullClubs.map((c) =>
+  // COMPLETENESS — club_timeline is the authoritative log for EVERY club, so we
+  // merge the timeline of each club the user belongs to. This guarantees no
+  // event is ever missed: inactive users (never materialized) and whale/pull
+  // clubs (never materialized) are both reconstructed here. Items also present
+  // in user_feed dedupe out below, with the materialized copy winning.
+  const timelineResults = await Promise.all(
+    clubs.map((c) =>
       queryClubTimeline(c.id, pageOpts).then((rows) => rows.map((i) => ({ ...i, via: 'pull' as const }))),
     ),
   );
 
-  const merged: FeedItem[] = [...pushRows, ...pullResults.flat()];
+  // push first so the materialized copy wins the dedupe (provenance = 'push' for
+  // rows the user had materialized, 'pull' for rows reconstructed from timeline).
+  const merged: FeedItem[] = [...pushRows, ...timelineResults.flat()];
 
   // Dedupe by id and sort newest-first (ULID desc).
   const seen = new Set<string>();
