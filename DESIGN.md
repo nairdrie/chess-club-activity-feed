@@ -42,9 +42,11 @@ flowchart TB
   FANOUT -->|push clubs: materialize active members| UFEED[(user_feed -- active cache)]
   FANOUT -->|thin payload| RT
   RT -->|activity id+cursor| UI
-  FANOUT -->|preference filter, then coalesce| DIGEST[(Redis: per-user digest counters)]
+  FANOUT -->|coalesce: HINCRBY counter| DIGEST[(Redis: per-user digest counters)]
+  FANOUT -->|window open: ZADD due-time| DUE[(Redis: digest due-set -- ZSET)]
   FANOUT -.->|high-priority: immediate| NOTIFY[(Redis Stream: notify)]
-  DIGEST --> SCHED[digest scheduler -- per window]
+  DUE -->|pop due <= now: who| SCHED[digest scheduler]
+  DIGEST -->|HGETALL then reset: what| SCHED
   SCHED -->|N new in club summary| NOTIFY
   NOTIFY --> NW[notify worker]
   NW -->|conditional-write dedupe| DDQ[(notify_dedupe)]
@@ -103,9 +105,12 @@ exist to reach people who are away), which for a busy whale is a huge fan-out. T
 reducers keep it sane. **Preference filter** (in fanout) drops muted clubs / disabled
 channels before anything is enqueued. **Digesting** then collapses volume by *time* rather
 than by dropping recipients: instead of one notification per event, fanout does an O(1)
-`HINCRBY digest:{user}:{club}` into a per-user counter, and a **digest scheduler** flushes
-each window (e.g. hourly) into a single summary — *"50 new activities in Team USA"* — so
-notification volume becomes **users × windows**, not **users × events**. High-priority
+`HINCRBY digest:{user}:{club}` into a per-user counter — and, when that opens a new window
+(the `HINCRBY` returns 1), `ZADD digest:due <now+window> {user}` to register a flush
+deadline. A **digest scheduler** pops the **due-set** (`ZRANGEBYSCORE … <= now`) to find
+exactly who's ready — never scanning all users — reads their counters (`HGETALL`), emits a
+single summary — *"50 new activities in Team USA"* — then clears both. Volume becomes
+**users × windows**, not **users × events**. High-priority
 event types (e.g. a match start) can bypass the digest for immediate delivery. Each digest
 is keyed `(user, club, window)`, so the same exactly-once conditional-write dedupe + DLQ
 applies — a window is delivered once or not at all. In-app is a live badge count off the
