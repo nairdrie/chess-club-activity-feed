@@ -6,13 +6,15 @@ SECONDS ?= 30
 CLUB    ?= whale
 PEAK_AT ?=
 
-# Per-worker replica counts (override on the CLI, e.g. `make up FANOUT=8`).
+# Per-worker replica counts (override on the CLI, e.g. `make up FANOUT=4`).
 # Fanout is the dominant stage under the whale load (the stage-lag gauges show
-# fanout lag ~= total e2e latency, drain lag ~= 0), so it runs widest. Push it
-# higher and watch `peak stage lag fanout=…` drop until it plateaus — the plateau
-# is the single-node backend ceiling (Redis + dynamodb-local), which is exactly
-# what managed Dynamo / Kafka+Scylla remove at scale.
-FANOUT ?= 6
+# fanout lag ~= total e2e latency, drain lag ~= 0). BUT on a single laptop, scaling
+# it too far BACKFIRES: 3 was measured best; at 6 the shared single Redis saturates
+# on digest HINCRBY/ZADD and starves drain (also Redis-bound), so BOTH lags blow up
+# and latency triples. That's the single-node ceiling — the tell is drain lag rising
+# alongside fanout. Managed Dynamo / a Redis cluster remove it at real scale; on a
+# laptop, keep fanout ~= (cores - infra) and watch the gauges when you tune.
+FANOUT ?= 3
 DRAIN  ?= 2
 NOTIFY ?= 3
 DIGEST ?= 2

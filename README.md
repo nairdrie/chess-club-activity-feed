@@ -385,11 +385,10 @@ Little's Law, `L = λ × W`, holding arrival rate λ fixed and cutting the time-
 system W means draining the queue faster, which is exactly what parallel consumers
 in the same consumer group do (Redis splits pending entries across them). So:
 
-- **fanout ×6** (default) — the heaviest stage, and the **stage-lag gauges prove
+- **fanout ×3** (default) — the heaviest stage, and the **stage-lag gauges prove
   it**: a 5k/20k whale run shows `fanout` lag ≈ the whole e2e latency while `drain`
-  lag is ~0. It's the biggest lever, so it runs widest. Override with
-  `make up FANOUT=8` (or `make scale FANOUT=8`) and watch `peak stage lag fanout=…`
-  fall — until it plateaus at the single-node backend ceiling (see below).
+  lag is ~100ms. It's the biggest lever — but see the warning below, more is *not*
+  better on one machine. Tune with `make up FANOUT=4` and watch the gauges.
 - **drain ×2** — keeps the MySQL persist off the critical path so buffer depth
   drains during the 20k spike instead of backing up. Gauge confirms it's not the
   bottleneck (drain lag ~100ms).
@@ -397,12 +396,19 @@ in the same consumer group do (Redis splits pending entries across them). So:
 - **digest ×2** — cheap; two schedulers share the due-set safely (atomic `ZREM`
   claim), so windows flush promptly even under load.
 
-**The plateau is the point.** Past a handful of fanout replicas the lag stops
-dropping: all replicas share one Redis (the digest `HINCRBY`/`ZADD` per active
-member) and one `dynamodb-local` (timeline writes), both single-process here. That
-ceiling *is* the demo's honest limit — and it's exactly what the documented swaps
-remove: managed DynamoDB / ScyllaDB and a Redis cluster (or Kafka) scale those
-backends horizontally, so fanout replicas keep buying latency past what a laptop can.
+**Over-scaling backfires — and the gauges show why.** Going `fanout=6` on a laptop
+made latency *3× worse* (2.0s → 7.4s), and the tell was **drain lag exploding too**
+(97ms → 52s). When you scale the bottleneck and a previously-healthy stage blows up
+alongside it, that's not the bottleneck moving — it's a **shared-resource ceiling**.
+Here every fanout replica hammers the **one** Redis with digest `HINCRBY`/`ZADD`
+(~2.2M ops/run); six of them saturate it, and drain — which also needs Redis for
+`XREADGROUP`/`XACK` — gets starved. Plus a laptop only has so many cores. So the
+knee is low here (~3); the fix at real scale is exactly the documented swaps —
+a Redis **cluster** (or Kafka for the streams) and managed DynamoDB/ScyllaDB give
+each stage its own horizontally-scaled backend, so fanout replicas keep buying
+latency instead of fighting each other over one Redis. **Lesson: scale by the
+gauge, not by hope — and when a second stage's lag rises with the one you scaled,
+you've hit a shared backend, not a parallelism limit.**
 
 **Two things changed since that study, both of which only help:**
 1. **Digesting** (this iteration) removes the notification amplification that made
