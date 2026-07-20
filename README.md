@@ -531,3 +531,23 @@ make load      # then retest at the spec profile (5k avg / 20k peak)
 (Under the hood: `docker compose down -v && docker compose up -d --build $(SCALE_FLAGS)`. Redis
 runs `appendonly no` with no volume and DynamoDB runs `-inMemory`, so tearing the
 containers down clears both; only MySQL has a volume, which `-v` removes.)
+
+### Troubleshooting: intermittent 404 on `/api/*`
+
+If `/api/metrics` (or any API call) flips between `200` and `404` at random, the
+nginx LB is holding **stale backend IPs**. Open-source nginx resolves the
+`upstream { server api1; ... }` hostnames **once at startup** and caches the IPs.
+A `docker compose up --build` (or a scale) recreates `api1`/`api2`/`rt*` with new
+IPs, but the `lb` container (stock nginx image, unchanged) is **not** recreated, so
+it round-robins `/api` to whatever now holds the old IP — often an `rt` pod, which
+listens on the same port and returns a bare `404` for everything except `/health`.
+
+Fix: recreate just the LB so it re-resolves DNS.
+
+```bash
+make lb-refresh                                   # or:
+docker compose up -d --force-recreate --no-deps lb
+```
+
+`make up` / `make reset` / `make scale` now do this automatically as their last
+step, so you only hit this if you drive `docker compose` directly.

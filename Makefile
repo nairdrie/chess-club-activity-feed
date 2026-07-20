@@ -10,15 +10,24 @@ PEAK_AT ?=
 # single-node bottleneck is fanout + notify, so we run those wide by default.
 SCALE_FLAGS = --scale fanout=3 --scale drain=2 --scale notify=3 --scale digest=2
 
-.PHONY: up down logs ps seed load rebuild clean reset scale health
+.PHONY: up down logs ps seed load rebuild clean reset scale health lb-refresh
 
 ## Bring the whole stack up at the demo's default scale (builds on first run).
 up:
 	docker compose up -d --build $(SCALE_FLAGS)
+	$(MAKE) --no-print-directory lb-refresh
 	@echo "\n➡  UI:       http://localhost:8080"
 	@echo "➡  Metrics:  http://localhost:8080/api/metrics"
 	@echo "➡  Load:     make load            # 5k avg / 20k peak, 30s, whale"
 	@echo "➡  Scale:    workers default to fanout=3 drain=2 notify=3 digest=2\n"
+
+## Recreate ONLY the nginx LB so it re-resolves backend container IPs via Docker
+## DNS. Open-source nginx resolves `upstream { server api1; ... }` names once at
+## startup and caches the IPs; a `--build`/scale recreates api/rt with NEW IPs,
+## so a stale LB round-robins /api to whatever now holds the old IP (e.g. an rt
+## pod, which 404s everything but /health). Refreshing the LB last fixes it.
+lb-refresh:
+	docker compose up -d --force-recreate --no-deps lb
 
 ## Stop everything (keep data volume).
 down:
@@ -36,6 +45,7 @@ clean:
 reset:
 	docker compose down -v
 	docker compose up -d --build $(SCALE_FLAGS)
+	$(MAKE) --no-print-directory lb-refresh
 	@echo "\n✔ clean stack up (fanout=3 drain=2 notify=3 digest=2) and re-seeded."
 	@echo "➡  UI:       http://localhost:8080"
 	@echo "➡  Load:     make load            # 5k avg / 20k peak, 30s, whale\n"
@@ -61,6 +71,7 @@ load:
 ## Re-apply the default worker scale (or edit SCALE_FLAGS above).
 scale:
 	docker compose up -d $(SCALE_FLAGS)
+	$(MAKE) --no-print-directory lb-refresh
 
 ## Quick health probe through the LB.
 health:
