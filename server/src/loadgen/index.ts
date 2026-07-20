@@ -13,8 +13,13 @@ import { EVENT_TYPES } from '../shared/types.js';
 const HTTP = process.env.TARGET_HTTP || 'http://localhost:8080';
 const WS = process.env.TARGET_WS || HTTP;
 const PREFIX = process.env.API_PREFIX ?? '/api';
-const RATE = Number(process.env.LOAD_RATE || 2000);
-const SECONDS = Number(process.env.LOAD_SECONDS || 20);
+// Spec load shape: ~5k events/sec AVERAGE with a ~20k/sec PEAK. We hold RATE as
+// the baseline and fire one PEAK second (LOAD_PEAK_AT, default mid-run) to prove
+// the buffer absorbs the spike and drains with zero loss.
+const RATE = Number(process.env.LOAD_RATE || 5000);
+const SECONDS = Number(process.env.LOAD_SECONDS || 30);
+const PEAK = Number(process.env.LOAD_PEAK || RATE);
+const PEAK_AT = process.env.LOAD_PEAK_AT ? Number(process.env.LOAD_PEAK_AT) : Math.floor(SECONDS / 2);
 const CLUB = (() => {
   const c = process.env.LOAD_CLUB || 'whale';
   if (c === 'whale') return WHALE_CLUB_ID;
@@ -91,29 +96,37 @@ function bar(label: string, value: string) {
   return `${label.padEnd(18)} ${value}`;
 }
 
+let maxBuffer = 0;
+
 async function main() {
-  console.log(`\n⚡ Load generator → club=${CLUB}  rate=${RATE}/s  duration=${SECONDS}s  target=${HTTP}\n`);
+  console.log(`\n⚡ Load generator → club=${CLUB}  avg=${RATE}/s  peak=${PEAK}/s @${PEAK_AT}s  duration=${SECONDS}s  target=${HTTP}\n`);
   const socket = await connectSocket();
 
   const start = Date.now();
   const tickMs = 50;
-  const perTick = Math.max(1, Math.round((RATE * tickMs) / 1000));
+  const cap = Math.max(RATE, PEAK);
   let prevDrained = 0;
   let prevT = Date.now();
 
   const firing = setInterval(() => {
-    if (Date.now() - start >= SECONDS * 1000) {
+    const elapsedMs = Date.now() - start;
+    if (elapsedMs >= SECONDS * 1000) {
       clearInterval(firing);
       return;
     }
+    // Baseline RATE every second, except the single PEAK second (the ~20k spike).
+    const curSec = Math.floor(elapsedMs / 1000);
+    const rate = curSec === PEAK_AT ? PEAK : RATE;
+    const perTick = Math.max(1, Math.round((rate * tickMs) / 1000));
     // simple in-flight cap so a slow API back-pressures the generator, not the box
-    if (inflight > RATE) return;
+    if (inflight > cap) return;
     for (let i = 0; i < perTick; i++) void fireOne();
   }, tickMs);
 
   const dash = setInterval(async () => {
     const m = await getMetrics();
     const now = Date.now();
+    maxBuffer = Math.max(maxBuffer, m.bufferDepth ?? 0);
     const drained = m.drained ?? 0;
     const drainRate = Math.round(((drained - prevDrained) / (now - prevT)) * 1000);
     prevDrained = drained;
@@ -174,11 +187,12 @@ async function main() {
   console.log('  LOAD TEST REPORT');
   console.log('══════════════════════════════════════════════');
   console.log(bar('club', CLUB));
-  console.log(bar('target rate', `${RATE}/s for ${SECONDS}s`));
+  console.log(bar('target rate', `avg ${RATE}/s, peak ${PEAK}/s (@${PEAK_AT}s) for ${SECONDS}s`));
   console.log(bar('fired', String(fired.size)));
   console.log(bar('delivered (realtime)', String(received.size)));
   console.log('');
   console.log(bar('end-to-end latency', `avg=${latN ? Math.round(latSum / latN) : 0}ms  max=${latMax}ms`));
+  console.log(bar('peak buffer depth', String(maxBuffer)) + '   (spike absorbed here)');
   console.log(bar('final buffer depth', String(m.bufferDepth ?? 0)));
   console.log(bar('drained→db', String(m.drained ?? 0)));
   console.log(bar('fanned', String(m.fanned ?? 0)));

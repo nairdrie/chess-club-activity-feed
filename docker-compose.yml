@@ -177,9 +177,11 @@ services:
       TARGET_HTTP: http://lb
       TARGET_WS: http://lb
       API_PREFIX: /api
-      LOAD_RATE: ${LOAD_RATE:-2000}
-      LOAD_SECONDS: ${LOAD_SECONDS:-20}
+      LOAD_RATE: ${LOAD_RATE:-5000}
+      LOAD_SECONDS: ${LOAD_SECONDS:-30}
       LOAD_CLUB: ${LOAD_CLUB:-whale}
+      LOAD_PEAK: ${LOAD_PEAK:-20000}
+      LOAD_PEAK_AT: ${LOAD_PEAK_AT:-}
     depends_on: [lb]
 
 volumes:
