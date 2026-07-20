@@ -44,8 +44,9 @@ Everything runs in Docker Compose: 3 socket.io pods, 2 API replicas, 5 worker
 types (drain, relay, fanout, digest, notify), Redis, MySQL, dynamodb-local, and an
 nginx LB (WebSocket-only realtime, no sticky sessions). `make up` starts the workers at the demo's
 default scale (`fanout=3 drain=2 notify=3 digest=2` — see
-[§ Scaling the demo](#scaling-the-demo-how-we-picked-the-worker-counts)); scale any
-worker further with `docker compose up -d --scale fanout=6`.
+[§ Scaling & bottleneck analysis](#scaling-the-demo-how-we-picked-the-worker-counts));
+tune any worker with `make up FANOUT=4` (but more is not always better — the section
+shows why).
 
 The `make load` profile matches the assignment's target — **~5,000 events/sec average
 with a ~20,000/sec peak** — by holding 5k/s and firing one 20k/s spike second
@@ -97,7 +98,9 @@ out explicitly so nothing here reads as more finished than it is.
   users × events to users × windows, visible as `Digest folded` vs `Notifications`
   in the load report / UI.
 - Guarantees: **load generator proves 0 lost / 0 duplicate** under load; buffer-depth /
-  drain-rate / e2e-latency metrics. Docker Compose (3 rt · 2 api · workers · nginx LB).
+  drain-rate / e2e-latency + **per-stage lag gauges** that localize the bottleneck
+  (see [§ Scaling & bottleneck analysis](#scaling-the-demo-how-we-picked-the-worker-counts)).
+  Docker Compose (3 rt · 2 api · workers · nginx LB).
 - Frontend: chess.com-style feed, infinite scroll, live updates, simulate-event, live guarantees widget.
 
 **Designed but NOT yet implemented (TODOs)**
@@ -362,97 +365,94 @@ watch buffer depth rise and drain while duplicates/lost stay at 0.
 ---
 
 <a name="scaling-the-demo-how-we-picked-the-worker-counts"></a>
-## Scaling the demo: how we picked the worker counts
+## Scaling & bottleneck analysis (observability-driven)
 
-The guarantees (0 loss / 0 dup) hold at **any** scale; what changes with worker
-count is **latency**. So the defaults in `make up` (`fanout=3 drain=2 notify=3
-digest=2`) come from a scaling study: run the same load, add workers, watch
-end-to-end latency fall. These runs used a constant **8,000 events/sec for 30s into
-the 500k whale** (a deliberately harsh single-club fan-out, worst case):
+The correctness guarantees (0 loss / 0 dup) are **structural** — outbox +
+ACK-after-commit + idempotent sinks — so they hold at *any* worker count. What
+scaling changes is **latency**, and latency here is almost entirely **queueing
+delay**. By Little's Law, `L = λ × W`: with arrival rate λ fixed, cutting
+time-in-system `W` means draining the queue faster, which is what adding consumers
+to a Redis Streams consumer group does (Redis splits pending entries across them).
+The engineering question is therefore *which* queue — and rather than guess, the
+pipeline is instrumented to answer it.
 
-| Workers (fanout/drain/notify) | Fired | Delivered | e2e latency avg | e2e max | Lost | Dup |
-|---|---:|---:|---:|---:|---:|---:|
-| **1 / 1 / 1** (unscaled) | 75,200 | 75,200 | **9,554 ms** | 16,809 ms | 0 | 0 |
-| **3 / 2 / 3** (scaled)   | 63,200 | 63,200 | **2,302 ms** | 4,420 ms | 0 | 0 |
+### The instrument: per-stage lag gauges
 
-**Reading it:** loss and duplication are 0 in both rows — that's structural (outbox
-+ ACK-after-commit + idempotent sinks), not something scaling buys. What scaling
-buys is **~4× lower latency**. On a single node the bottleneck is the **fanout
-stage**: every whale event drives a batch of DynamoDB writes *and* (pre-digest)
-amplified into ~51 notification jobs, so the `stream:events` and `stream:notify`
-consumers queue up. High latency here is almost entirely **queueing delay** — by
-Little's Law, `L = λ × W`, holding arrival rate λ fixed and cutting the time-in-
-system W means draining the queue faster, which is exactly what parallel consumers
-in the same consumer group do (Redis splits pending entries across them). So:
+e2e latency tells you *that* it's slow, not *where*. So `drain` and `fanout` each
+export a lag gauge — the age of the oldest event in a batch at the moment that
+stage finishes it (worst-of-batch, `SET` last-write-wins):
 
-- **fanout ×3** (default) — the heaviest stage, and the **stage-lag gauges prove
-  it**: a 5k/20k whale run shows `fanout` lag ≈ the whole e2e latency while `drain`
-  lag is ~100ms. It's the biggest lever — but see the warning below, more is *not*
-  better on one machine. Tune with `make up FANOUT=4` and watch the gauges.
-- **drain ×2** — keeps the MySQL persist off the critical path so buffer depth
-  drains during the 20k spike instead of backing up. Gauge confirms it's not the
-  bottleneck (drain lag ~100ms).
-- **notify ×3** — the notification sink was the deepest backlog pre-digest.
-- **digest ×2** — cheap; two schedulers share the due-set safely (atomic `ZREM`
-  claim), so windows flush promptly even under load.
+- **`lagDrain`** — ingest → durable in MySQL (the spike-absorber depth, in ms).
+- **`lagFanout`** — ingest → fanned out (feed written + realtime emitted).
 
-**Over-scaling backfires — and the gauges show why.** Going `fanout=6` on a laptop
-made latency *3× worse* (2.0s → 7.4s), and the tell was **drain lag exploding too**
-(97ms → 52s). When you scale the bottleneck and a previously-healthy stage blows up
-alongside it, that's not the bottleneck moving — it's a **shared-resource ceiling**.
-Here every fanout replica hammers the **one** Redis with digest `HINCRBY`/`ZADD`
-(~2.2M ops/run); six of them saturate it, and drain — which also needs Redis for
-`XREADGROUP`/`XACK` — gets starved. Plus a laptop only has so many cores. So the
-knee is low here (~3); the fix at real scale is exactly the documented swaps —
-a Redis **cluster** (or Kafka for the streams) and managed DynamoDB/ScyllaDB give
-each stage its own horizontally-scaled backend, so fanout replicas keep buying
-latency instead of fighting each other over one Redis. **Lesson: scale by the
-gauge, not by hope — and when a second stage's lag rises with the one you scaled,
-you've hit a shared backend, not a parallelism limit.**
+They surface live in `make load` (`stage lag drain=…ms fanout=…ms`), as peaks in
+the final report, and in the UI's "Live guarantees" widget. Decompose them:
+`lagFanout − lagDrain` ≈ time queued in outbox/relay/`stream:events`. Whichever
+gauge dominates is where the work is piling up — that's the stage to scale.
 
-**Two things changed since that study, both of which only help:**
-1. **Digesting** (this iteration) removes the notification amplification that made
-   `notify` the deepest queue — the `stream:notify` backlog that used to trim under
-   sustained load is gone, because volume is now users × windows, not users × events.
-2. The default profile is now the **spec's 5k avg / 20k peak** rather than a flat
-   8k/s, so the average load is *lower* than the study's and the single 20k second
-   is absorbed by the ingest buffer (watch `peak buffer depth` in the report rise,
-   then `final buffer depth` return to 0).
+### The measurements
 
-Reproduce from a clean slate:
+All runs hit the **500k-member whale** (single club, maximum fan-out — the worst
+case). Early rows used a flat 8k/s (before the gauges existed); later rows use the
+spec's **5k avg / 20k peak** profile with the gauges live:
+
+| Config (fanout/drain/notify/digest) | Profile | e2e avg | e2e max | drain lag | fanout lag | Lost | Dup |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **1 / 1 / 1 / 1** (unscaled) | 8k flat | 9,554 ms | 16,809 ms | — | — | 0 | 0 |
+| **3 / 2 / 3 / 2** | 8k flat | 2,302 ms | 4,420 ms | — | — | 0 | 0 |
+| **3 / 2 / 3 / 2** (default) | 5k/20k | **2,030 ms** | 4,257 ms | **97 ms** | **3,726 ms** | 0 | 0 |
+| **6 / 2 / 3 / 2** (over-scaled) | 5k/20k | 7,379 ms | 52,501 ms | **52,409 ms** | 52,504 ms | 0 | 0 |
+
+### What the data says
+
+1. **Scaling the pipeline works: ~4× lower latency** going 1→3 replicas (9.6s →
+   2.3s). Loss/dup stay 0 throughout — scaling buys latency, not correctness.
+2. **The gauges localize the bottleneck to fanout.** At the default, `fanout` lag
+   (3,726 ms) is ≈ the whole e2e latency while `drain` lag is ~100 ms. Fanout is the
+   heaviest stage — per whale event it does a DynamoDB timeline write **and** a
+   digest `HINCRBY`/`ZADD` for every active member (~100 Redis ops/event at
+   `ACTIVE_SAMPLE=50`; `digest folded` shows ~2.2M counter ops per run). That's why
+   fanout runs widest by default.
+3. **But over-scaling backfires — and the gauge shows *why*.** `fanout=6` made
+   latency **3× worse** (2.0s → 7.4s), and the tell is that **`drain` lag exploded
+   too** (97 ms → 52 s). Drain has nothing to do with fanout; when a
+   previously-healthy stage blows up *alongside* the one you scaled, you haven't
+   moved a bottleneck, you've hit a **shared resource**. Here it's the single Redis:
+   six fanout replicas saturate it with digest ops, and `drain` — which needs that
+   same Redis for `XREADGROUP`/`XACK` — starves. (A laptop's finite cores compound
+   it: ~15 Node processes oversubscribe.) So the knee on one machine is low (~3).
+
+### The takeaway (the rule this gives you)
+
+**Scale by the gauge, not by hope.** Read the dominant lag, scale that stage, and
+re-measure. The moment a *second* stage's lag rises with the one you scaled, stop —
+you're contending for a shared backend, not short on parallelism. The fix then
+isn't more workers, it's the documented **swaps**: a Redis **cluster** (or Kafka for
+the streams) so digest counters and ingest streams don't fight over one instance,
+and managed **DynamoDB/ScyllaDB** for the writes. Each stage gets its own
+horizontally-scaled backend, and fanout replicas keep buying latency instead of
+fighting each other — which is precisely the difference between a laptop demo and
+production.
+
+Two later changes only help this picture: **digesting** removed the notification
+amplification that used to make `notify` the deepest queue (volume is now
+users × windows, not users × events), and the **5k/20k profile** keeps average load
+below the old flat 8k while proving the ingest buffer absorbs the 20k spike (watch
+`peak buffer depth` rise, then `final buffer depth` return to 0).
+
+### Reproduce it
 
 ```bash
-make reset     # wipe + rebuild + reseed at default scale
-make load      # 5k avg / 20k peak, 30s, whale
+make reset                                  # clean slate at the default scale (fanout=3)
+make load                                   # 5k avg / 20k peak, 30s, whale
+make scale FANOUT=1 DRAIN=1 NOTIFY=1 DIGEST=1 && make load   # the unscaled floor
+make scale FANOUT=6 && make load            # watch drain lag blow up (shared-Redis ceiling)
 ```
 
-To see the latency curve yourself, drop to one of everything and compare:
-
-```bash
-docker compose up -d --scale fanout=1 --scale drain=1 --scale notify=1 --scale digest=1
-make load
-```
-
-### Diagnosing latency: stage-lag gauges
-
-e2e latency alone can't tell you *which* worker to scale, so the pipeline exports
-two stage-lag gauges (oldest-event age at stage completion, worst-of-batch):
-
-- `lagDrain` — ingest → durable in MySQL (the spike-absorber depth in ms)
-- `lagFanout` — ingest → fanned out (feed written + realtime emitted)
-
-`make load` prints them live (`stage lag drain=…ms fanout=…ms`) and the report
-prints the peaks; the UI widget shows them too. Read them like this: if
-`lagDrain` is high, scale **drain** (or MySQL is the limit); if `lagDrain` is low
-but `lagFanout` is high, the queueing is in relay/fanout — scale **fanout**. On a
-single laptop, scaling past the physical core count stops helping; the gauges make
-that visible too (lags plateau instead of dropping).
-
-One measurement caveat from this project's own history: a run during the broken-LB
-period showed ~180ms average — that number was *not* a better configuration, it was
-a throttled pipeline (many POSTs failing fast at the LB meant far less inflow, so
-no queueing). Always sanity-check `fired` and `drained→db` match before comparing
-latency numbers across runs.
+**Measurement caveat** (a real trap from this project's history): a run during the
+broken-LB period showed ~180 ms avg — that was *not* a better config, it was a
+throttled pipeline (POSTs 404ing at the LB meant far less inflow, so nothing
+queued). Always confirm `fired` ≈ `drained→db` before trusting a latency number.
 
 ---
 
