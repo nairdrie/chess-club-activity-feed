@@ -1,5 +1,11 @@
 # Chess.com Club Activity Feed: working demo
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Club Activity Feed UI — a chess.com-style shell with the live club activity feed, demo controls to fire events, and a live-guarantees panel showing 0 duplicates and 0 lost under load" width="100%">
+  <br>
+  <em>The chess.com-style shell: a live activity feed (each row tagged <code>via pull</code> for the whale path), demo controls to fire events, and the live-guarantees panel proving <strong>0 duplicates / 0 lost</strong> with live e2e latency, all under load.</em>
+</p>
+
 A runnable, horizontally-scalable implementation of the "Club Activity Feed"
 assignment: when something happens in a club (member joins, team match starts,
 poll opens, announcement), it shows up near-real-time in every member's feed on
