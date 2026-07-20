@@ -28,6 +28,20 @@ export const config = {
   // it keeps a 500k-member whale tractable while exercising the exact code path.
   activeSample: num('ACTIVE_SAMPLE', 50),
 
+  // notification digesting — collapse "one notification per event" into
+  // "one summary per (user, club, window)". The window length trades freshness
+  // for volume; kept short here so a 30s load test flushes several windows.
+  digestWindowMs: num('DIGEST_WINDOW_MS', 5000),
+  digestPollMs: num('DIGEST_POLL_MS', 500),
+  digestBatch: num('DIGEST_BATCH', 500),
+  // High-priority event types that BYPASS the digest and deliver immediately
+  // (comma-separated, e.g. "match_start"). Default empty so the demo shows the
+  // full collapse; set IMMEDIATE_TYPES=match_start to exercise the bypass.
+  immediateTypes: str('IMMEDIATE_TYPES', '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
   // infra
   redisUrl: str('REDIS_URL', 'redis://localhost:6379'),
   mysql: {

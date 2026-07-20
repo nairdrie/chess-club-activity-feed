@@ -3,7 +3,7 @@ import { config } from '../shared/config.js';
 import { log } from '../shared/logger.js';
 import { makeRedis, waitForRedis } from '../shared/redis.js';
 import { runStreamConsumer } from '../shared/consumer.js';
-import { STREAM_EVENTS, STREAM_NOTIFY, GROUP_FANOUT, METRIC, clubMembers, ACTIVE_USERS, feedCache } from '../shared/keys.js';
+import { STREAM_EVENTS, STREAM_NOTIFY, GROUP_FANOUT, METRIC, clubMembers, ACTIVE_USERS, feedCache, userDigest, DIGEST_DUE } from '../shared/keys.js';
 import { bumpMetric } from '../shared/metrics.js';
 import { classifyKind } from '../shared/clubs.js';
 import {
@@ -81,14 +81,17 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
   const userFeedRows: Record<string, unknown>[] = [];
   const cachePipe = redis.pipeline();
   const notifyPipe = redis.pipeline();
+  const digestPipe = redis.pipeline();
   let materialized = 0;
   let timelineWrites = 0;
   let notifyEnqueued = 0;
+  let digestCoalesced = 0;
 
   for (const ev of events) {
     const members = membersByClub.get(ev.clubId) ?? [];
     const kind = classifyKind(ev.memberCount);
     const item = toFeedItem(ev, kind);
+    const immediate = config.immediateTypes.includes(ev.type);
 
     // ALWAYS append to club_timeline — the complete, authoritative per-club log.
     // This is what makes the active-set optimization SOUND: any feed we skip
@@ -113,14 +116,30 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
     const thin: ThinPayload = { eventId: ev.id, cursor: ev.id, clubId: ev.clubId, type: ev.type, createdAt: ev.createdAt };
     emitter.to(`club:${ev.clubId}`).emit('activity', thin);
 
-    // preference filter (cheapest reducer) → enqueue only enabled channels
+    // Notification fan-out, after the preference filter (cheapest reducer: muted
+    // clubs / disabled channels never enqueue). Two paths:
+    //  - high-priority events BYPASS the digest and deliver immediately.
+    //  - everything else COALESCES into a per-user digest counter (O(1) HINCRBY),
+    //    opening a flush window (ZADD NX) the first time it fires. The scheduler
+    //    turns each window into one "N new in {club}" summary — so notification
+    //    volume becomes users × windows, not users × events.
     for (const uid of members) {
-      for (const channel of channelsFor(prefs.get(uid)!, ev.clubId)) {
-        notifyPipe.xadd(
-          STREAM_NOTIFY, 'MAXLEN', '~', '3000000', '*',
-          'data', JSON.stringify({ eventId: ev.id, clubId: ev.clubId, userId: uid, channel, type: ev.type }),
-        );
-        notifyEnqueued += 1;
+      const channels = channelsFor(prefs.get(uid)!, ev.clubId);
+      if (channels.length === 0) continue;
+      if (immediate) {
+        for (const channel of channels) {
+          notifyPipe.xadd(
+            STREAM_NOTIFY, 'MAXLEN', '~', '3000000', '*',
+            'data', JSON.stringify({ kind: 'event', eventId: ev.id, clubId: ev.clubId, userId: uid, channel, type: ev.type }),
+          );
+          notifyEnqueued += 1;
+        }
+      } else {
+        // One O(1) counter bump per (user, club); the window deadline is set once
+        // per user (NX) and anchored to the first event, so it can't be pushed back.
+        digestPipe.hincrby(userDigest(uid), ev.clubId, 1);
+        digestPipe.zadd(DIGEST_DUE, 'NX', String(ev.createdAt + config.digestWindowMs), uid);
+        digestCoalesced += 1;
       }
     }
   }
@@ -131,6 +150,7 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
     userFeedRows.length ? batchPut(TABLE_USER_FEED, userFeedRows) : Promise.resolve(),
     cachePipe.length ? cachePipe.exec() : Promise.resolve(),
     notifyPipe.length ? notifyPipe.exec() : Promise.resolve(),
+    digestPipe.length ? digestPipe.exec() : Promise.resolve(),
   ]);
 
   bumpMetric(redis, METRIC.realtimeEmitted, events.length);
@@ -138,6 +158,7 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
   if (materialized) bumpMetric(redis, METRIC.materialized, materialized);
   if (timelineWrites) bumpMetric(redis, METRIC.timelineWrites, timelineWrites);
   if (notifyEnqueued) bumpMetric(redis, METRIC.notifyEnqueued, notifyEnqueued);
+  if (digestCoalesced) bumpMetric(redis, METRIC.digestCoalesced, digestCoalesced);
 }
 
 async function main() {

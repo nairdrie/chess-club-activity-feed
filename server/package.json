@@ -10,6 +10,7 @@
     "worker:drain": "tsx src/workers/drain.ts",
     "worker:relay": "tsx src/workers/relay.ts",
     "worker:fanout": "tsx src/workers/fanout.ts",
+    "worker:digest": "tsx src/workers/digest.ts",
     "worker:notify": "tsx src/workers/notify.ts",
     "seed": "tsx src/seed.ts",
     "loadgen": "tsx src/loadgen/index.ts",

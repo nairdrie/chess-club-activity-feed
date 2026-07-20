@@ -7,8 +7,9 @@
 #   loadgen (tools profile)
 #
 #   pipeline:  API ─XADD▶ stream:ingest ─drain▶ MySQL(events+outbox)
-#              ─relay▶ stream:events ─fanout▶ Dynamo(feed) + realtime + stream:notify
-#              ─notify▶ deliver (deduped)
+#              ─relay▶ stream:events ─fanout▶ Dynamo(feed) + realtime
+#                       + digest counters / immediate ─notify▶ deliver (deduped)
+#              digest scheduler ─flush window▶ stream:notify
 #
 #   infra: redis (streams/cache/dedupe), mysql (durable + outbox), dynamodb-local (feed store)
 #
@@ -33,6 +34,9 @@ x-backend: &backend
     PUSH_THRESHOLD: ${PUSH_THRESHOLD:-5000}
     ACTIVE_DAYS: ${ACTIVE_DAYS:-7}
     ACTIVE_SAMPLE: ${ACTIVE_SAMPLE:-50}
+    DIGEST_WINDOW_MS: ${DIGEST_WINDOW_MS:-5000}
+    DIGEST_POLL_MS: ${DIGEST_POLL_MS:-500}
+    IMMEDIATE_TYPES: ${IMMEDIATE_TYPES:-}
     WHALE_MEMBERS: ${WHALE_MEMBERS:-500000}
     SMALL_MEMBERS: ${SMALL_MEMBERS:-1200}
     DRAIN_BATCH: ${DRAIN_BATCH:-256}
@@ -136,6 +140,12 @@ services:
     <<: *backend
     command: ["npm", "run", "worker:fanout"]
     environment: { <<: *backend-env, ROLE: fanout }
+  # digest scheduler: pops the due-set and flushes per-user counters into
+  # one "N new in {club}" summary per window (the notification volume reducer).
+  digest:
+    <<: *backend
+    command: ["npm", "run", "worker:digest"]
+    environment: { <<: *backend-env, ROLE: digest }
   notify:
     <<: *backend
     command: ["npm", "run", "worker:notify"]

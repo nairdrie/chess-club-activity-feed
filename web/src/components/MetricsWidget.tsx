@@ -13,6 +13,8 @@ const SERVER_FIELDS: { key: string; label: string; highlight?: boolean }[] = [
   { key: 'published', label: 'Published' },
   { key: 'fanned', label: 'Fanned' },
   { key: 'materialized', label: 'Materialized' },
+  { key: 'digestCoalesced', label: 'Digest folded' },
+  { key: 'digestFlushed', label: 'Digest summaries' },
   { key: 'notifyDelivered', label: 'Notifications' },
   { key: 'notifyDeduped', label: 'Deduped (exactly-once)', highlight: true },
   { key: 'bufferDepth', label: 'Buffer depth', highlight: true },

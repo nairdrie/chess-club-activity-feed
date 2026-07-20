@@ -214,12 +214,14 @@ export async function queryClubTimeline(
 }
 
 /**
- * Exactly-once claim at the sink: conditional PUT keyed by (user, event, channel).
+ * Exactly-once claim at the sink: conditional PUT keyed by (user, dedupeKey, channel).
+ * dedupeKey is the event ULID for immediate jobs, or `digest:{club}:{window}` for
+ * digest jobs — either way the winner delivers and every redelivery is a no-op.
  * Returns true if we won the claim, false if it was already delivered (the dedupe).
  */
 export async function claimNotification(
   userId: string,
-  eventId: string,
+  dedupeKey: string,
   channel: string,
 ): Promise<boolean> {
   try {
@@ -228,7 +230,7 @@ export async function claimNotification(
         TableName: TABLE_NOTIFY_DEDUPE,
         Item: {
           pk: `USER#${userId}`,
-          sk: `${eventId}#${channel}`,
+          sk: `${dedupeKey}#${channel}`,
           ttl: Math.floor(Date.now() / 1000) + 7 * 86400,
         },
         ConditionExpression: 'attribute_not_exists(pk)',

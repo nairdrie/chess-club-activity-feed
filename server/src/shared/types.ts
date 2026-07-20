@@ -57,10 +57,24 @@ export interface Preferences {
 
 export type NotificationChannel = 'in_app' | 'email' | 'push';
 
+export type NotificationKind = 'event' | 'digest';
+
+/**
+ * A job on stream:notify. Two shapes share the sink so exactly-once dedupe + DLQ
+ * apply uniformly:
+ *  - kind 'event'  — one immediate notification for a single high-priority event.
+ *  - kind 'digest' — one coalesced summary for a (user, club, window).
+ */
 export interface NotificationJob {
-  eventId: string;
-  clubId: string;
+  kind: NotificationKind;
   userId: string;
+  clubId: string;
   channel: NotificationChannel;
-  type: EventType;
+  // event jobs (immediate / high-priority bypass):
+  eventId?: string;
+  type?: EventType;
+  // digest jobs (window summary):
+  clubName?: string;
+  count?: number;
+  window?: number; // window-close epoch ms; part of the (user, club, window) dedupe key
 }

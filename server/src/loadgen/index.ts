@@ -133,7 +133,9 @@ async function main() {
     console.log(bar('fanned', String(m.fanned ?? 0)));
     console.log(bar('materialized', String(m.materialized ?? 0)));
     console.log(bar('timeline writes', String(m.timelineWrites ?? 0)));
-    console.log(bar('notify delivered', String(m.notifyDelivered ?? 0)));
+    console.log(bar('digest folded', String(m.digestCoalesced ?? 0)) + '   (events → counters)');
+    console.log(bar('digest summaries', String(m.digestFlushed ?? 0)));
+    console.log(bar('notify delivered', String(m.notifyDelivered ?? 0)) + '   (immediate + digests)');
     console.log('');
     console.log(bar('e2e latency', `last=${lastLatency}ms avg=${avgLat}ms max=${latMax}ms`));
     console.log('');
@@ -180,6 +182,8 @@ async function main() {
   console.log(bar('final buffer depth', String(m.bufferDepth ?? 0)));
   console.log(bar('drained→db', String(m.drained ?? 0)));
   console.log(bar('fanned', String(m.fanned ?? 0)));
+  console.log(bar('digest folded', String(m.digestCoalesced ?? 0)));
+  console.log(bar('digest summaries', String(m.digestFlushed ?? 0)));
   console.log(bar('notify delivered', String(m.notifyDelivered ?? 0)));
   console.log(bar('notify deduped', String(m.notifyDeduped ?? 0)));
   console.log('');

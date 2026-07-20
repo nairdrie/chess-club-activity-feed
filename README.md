@@ -23,9 +23,10 @@ zero duplication under load**.
 > note. This README is the deep-dive / run guide behind it.
 
 > **Real vs. designed:** the core pipeline and its guarantees are implemented and
-> load-tested end-to-end; several refinements in the design (notification digesting,
-> cache read-throughs, DLQ policy) are **designed but not yet wired**. Honest status
-> and TODOs are in [§ Implemented vs. designed](#implemented-vs-designed-honest-status--todos).
+> load-tested end-to-end, including **notification digesting** (the fan-out reducer);
+> a few remaining refinements (cache read-throughs, DLQ policy) are **designed but
+> not yet wired**. Honest status and TODOs are in
+> [§ Implemented vs. designed](#implemented-vs-designed-honest-status--todos).
 
 ---
 
@@ -39,9 +40,10 @@ make load RATE=8000 SECONDS=30 CLUB=whale   # spike a 500k-member club
 # watch the report: buffer depth absorbs the spike, DUPLICATES=0, LOST=0
 ```
 
-Everything runs in Docker Compose: 3 socket.io pods, 2 API replicas, 4 worker
-types, Redis, MySQL, dynamodb-local, and an nginx LB with sticky WebSocket
-sessions. Scale any worker: `docker compose up -d --scale fanout=3 --scale drain=2`.
+Everything runs in Docker Compose: 3 socket.io pods, 2 API replicas, 5 worker
+types (drain, relay, fanout, digest, notify), Redis, MySQL, dynamodb-local, and an
+nginx LB with sticky WebSocket sessions. Scale any worker:
+`docker compose up -d --scale fanout=3 --scale drain=2`.
 
 ---
 
@@ -58,6 +60,7 @@ sessions. Scale any worker: `docker compose up -d --scale fanout=3 --scale drain
 | Event log | Redis Streams (`stream:events`) | partitioned by `club_id`; **Kafka at scale** |
 | Feed store | dynamodb-local | `user_feed` (push) + `club_timeline` (pull); **ScyllaDB at scale** |
 | Notifications | Redis Streams + Dynamo conditional write | separate consumer group, **exactly-once**, DLQ |
+| Digesting | Redis hash counters + due-set ZSET + scheduler | coalesce fan-out to one summary per (user, club, window) |
 | Cache | Redis sorted sets | hot-feed pages, `noeviction` |
 
 ---
@@ -78,7 +81,14 @@ out explicitly so nothing here reads as more finished than it is.
   cursor pagination (`before`/`after`). Inactive-member completeness **verified**.
 - Realtime: **3 socket.io pods + Redis adapter**, thin payload, client REST backfill.
 - Notifications: preference-filtered enqueue, **exactly-once** dedupe (conditional
-  write on `(user, event, channel)`), separate consumer group + DLQ.
+  write on `(user, event/window, channel)`), separate consumer group + DLQ.
+- **Notification digesting**: fanout coalesces events into per-user counters
+  (`HINCRBY digest:{user}` + `ZADD NX` due-set) instead of one job per event; a
+  **digest scheduler** (`workers/digest.ts`) pops the due-set each window and emits
+  one *"N new in {club}"* summary per (user, club, window). High-priority types can
+  **bypass** for immediate delivery (`IMMEDIATE_TYPES`). Volume drops from
+  users × events to users × windows, visible as `Digest folded` vs `Notifications`
+  in the load report / UI.
 - Guarantees: **load generator proves 0 lost / 0 duplicate** under load; buffer-depth /
   drain-rate / e2e-latency metrics. Docker Compose (3 rt · 2 api · workers · nginx LB).
 - Frontend: chess.com-style feed, infinite scroll, live updates, simulate-event, live guarantees widget.
@@ -86,25 +96,25 @@ out explicitly so nothing here reads as more finished than it is.
 **Designed but NOT yet implemented (TODOs)**
 1. **Hot-page ZSET cache is write-only.** Fanout populates `cache:feed:{user}`, but the
    read path queries DynamoDB directly. *TODO: `ZREVRANGE`-first read-through + Dynamo fallback + warm-on-miss.*
-2. **Notification digesting is design-only.** The code enqueues one immediate notification
-   per (active member × event). *TODO: `HINCRBY` digest counters + due-set ZSET + scheduler +
-   "N new in {club}" summaries + the high-priority/immediate bypass.*
-3. **Notification audience is a simplification.** The code notifies only **active** members;
-   push/email should reach **preference-enabled members regardless of activity** (bounded by
-   digesting). *TODO: split feed-materialization audience (active) from notification audience (preference-enabled).*
-4. **`user:{id}:clubs` cache not built.** The feed read resolves the user's clubs via a MySQL
+2. **Notification audience is still active-gated.** Digesting is built, but fanout coalesces
+   only over the **active** set it already resolved; push/email should reach **preference-enabled
+   members regardless of activity**. *TODO: split feed-materialization audience (active) from
+   notification audience (preference-enabled), then digest over the wider set.*
+3. **`user:{id}:clubs` cache not built.** The feed read resolves the user's clubs via a MySQL
    join. *TODO: cache-aside in Redis + invalidate on join/leave.*
-5. **Preferences read-through missing.** Prefs are write-through cached; on a cache miss
+4. **Preferences read-through missing.** Prefs are write-through cached; on a cache miss
    fanout applies a default instead of reading MySQL. *TODO: read-through on miss.*
-6. **DLQ policy is naive.** The notify worker DLQs on **any** delivery failure. *TODO: circuit
+5. **DLQ policy is naive.** The notify worker DLQs on **any** delivery failure. *TODO: circuit
    breaker + transient (hold/retry) vs. permanent (DLQ) classification + an idempotency-key-with-status
    reaper for the claim-then-crash gap.*
-7. **Read path over-merges.** It merges **every** club's timeline each read (correct but not
+6. **Read path over-merges.** It merges **every** club's timeline each read (correct but not
    read-efficient). *TODO: activity-aware read: serve active users from `user_feed`/cache, merge
    only pull timelines, reconstruct on return.*
-8. **Per-club whale timeline cache not built** (one shared cache entry for all members of a hot
+7. **Per-club whale timeline cache not built** (one shared cache entry for all members of a hot
    club, the biggest read-offload for whales). *TODO.*
-9. **Delivery is simulated.** `deliver()` is a no-op; no real APNs / FCM / SES.
+8. **Digest delivery is simulated and treats in-app like email/push.** `deliver()` is a no-op
+   (no real APNs / FCM / SES), and in-app should be a live badge off the counter rather than a
+   digested job. *TODO: real transport adapters + in-app-as-badge.*
 
 **Intentional demo substitutions** (documented swaps, not gaps): Redis Streams *is* the
 event log (Kafka at scale); dynamodb-local *is* the feed store (managed DynamoDB / ScyllaDB
@@ -134,18 +144,24 @@ flowchart TB
   RELAY -->|publish| EVENTS[(Redis Stream: events - key=club_id)]
   EVENTS --> FANOUT[fanout worker]
 
-  FANOUT -->|push: materialize active members| UFEED[(Dynamo user_feed)]
-  FANOUT -->|pull: 1 append| CTL[(Dynamo club_timeline)]
+  FANOUT -->|always: 1 append per club| CTL[(Dynamo club_timeline - authoritative log)]
+  FANOUT -->|push clubs: materialize active members| UFEED[(Dynamo user_feed - active cache)]
   FANOUT -->|thin payload via redis-emitter| RTADAPT{{redis adapter}}
   RTADAPT --> RT
   RT -->|activity: id+cursor| UI
-  FANOUT -->|preference filter| NOTIFY[(Redis Stream: notify)]
+
+  FANOUT -->|coalesce: HINCRBY counter| DIGEST[(Redis: per-user digest counters)]
+  FANOUT -->|window open: ZADD NX due-time| DUE[(Redis: digest due-set - ZSET)]
+  FANOUT -.->|high-priority: immediate| NOTIFY[(Redis Stream: notify)]
+  DUE -->|pop due <= now: who| SCHED[digest scheduler]
+  DIGEST -->|HGETALL then reset: what| SCHED
+  SCHED -->|N new in club summary| NOTIFY
   NOTIFY --> NWORKER[notify worker]
   NWORKER -->|conditional write dedupe| DDEDUPE[(Dynamo notify_dedupe)]
   NWORKER -.->|on failure| DLQ[(notify DLQ)]
 
-  API -->|read merge push+pull| UFEED
-  API --> CTL
+  API -->|read: fast path| UFEED
+  API -->|read: merge for completeness| CTL
   CACHE[(Redis ZSET hot pages)] --- API
 ```
 
@@ -163,6 +179,8 @@ sequenceDiagram
   participant F as fanout
   participant FS as Dynamo feed store
   participant RT as socket.io (+adapter)
+  participant DG as digest counters
+  participant SCH as digest scheduler
   participant N as notify
 
   C->>API: POST /events {clubId,type}
@@ -184,8 +202,11 @@ sequenceDiagram
   RT-->>C: "activity" (id + cursor)
   C->>API: GET /feed?after=cursor  # backfill body via read path
   API-->>C: full items
-  F->>N: enqueue notifications (after preference filter)
-  N->>FS: conditional write (user,event,channel)
+  F->>DG: preference filter, then coalesce - HINCRBY per (user, club)
+  Note over DG: many events collapse to one counter per user/club/window
+  SCH->>DG: each window - HGETALL then reset counters
+  SCH->>N: one digest - "N new in {club}"
+  N->>FS: conditional write (user, club, window)
   N-->>N: deliver once / dedupe / DLQ
 ```
 
@@ -225,11 +246,13 @@ skipping their materialization never loses data. See `activeMembersOf()` in
 `fanout.ts`. (`ACTIVE_SAMPLE` sizes this set in the demo so a laptop can run a
 "500k" club; the *code path* is exactly the production one.)
 
-Note the demo also gates *notifications* on the active set for simplicity, but
-that's a conflation: push/email exist to reach **inactive** users, so
-notifications should target **preference-enabled** members regardless of activity,
-with **digesting** to bound volume (see decision #5). Feed materialization =
-active-gated; notifications = preference-gated.
+Note the demo still gates *notifications* on the active set: fanout coalesces
+(decision #5) over the same active members it already resolved. That's a
+simplification — push/email exist to reach **inactive** users, so notifications
+should target **preference-enabled** members regardless of activity. Digesting (the
+volume reducer) is now built; widening its audience beyond the active set is the
+remaining step (TODO #2). Feed materialization = active-gated; notifications should
+be preference-gated.
 
 ### 3. The spike absorber: never touch the DB on the request path
 `POST /events` does an O(1) `XADD` to `stream:ingest` and returns immediately
@@ -257,14 +280,17 @@ Two independent safety nets:
   from at-least-once upstream can never produce a duplicate notification.
 - **Separate consumer group + DLQ** so notification delivery failures never block
   the feed path.
-- **Digesting bounds the fan-out** (design; not in the demo code). Rather than one
-  notification per event, fanout does an O(1) `HINCRBY digest:{user}:{club}` and a
-  **digest scheduler** flushes each window into a single summary (*"50 new
-  activities in Team USA"*), so volume is **users × windows**, not **users ×
-  events**. High-priority event types bypass for immediate delivery; each digest is
-  keyed `(user, club, window)` so the same dedupe + DLQ apply. This is how
-  notifications can reach *all* preference-enabled members (incl. inactive) without
-  spamming. See `DESIGN.md` for the diagrams.
+- **Digesting bounds the fan-out** (implemented: `workers/digest.ts`). Rather than
+  one notification per event, fanout does an O(1) `HINCRBY digest:{user}` (one field
+  per club) and, on the first event of a window, `ZADD NX digest:due`. A **digest
+  scheduler** pops the due-set (`ZRANGEBYSCORE <= now`), reads each user's counters
+  (`HGETALL` + reset, atomically via a Lua script so a mid-flush event is never
+  lost or double-counted), and emits a single summary (*"50 new activities in Team
+  USA"*), so volume is **users × windows**, not **users × events**. High-priority
+  event types (`IMMEDIATE_TYPES`) bypass for immediate delivery; each digest is
+  keyed `(user, club, window)` so the same exactly-once dedupe + DLQ apply. The load
+  report shows the collapse: `digest folded` (events in) vs `notify delivered`
+  (summaries out).
 
 ### 6. Realtime: thin payload, client backfills
 Fanout pushes only `{eventId, cursor, clubId, createdAt}` to the club room (via
@@ -421,4 +447,22 @@ Makefile               up / down / load / scale / logs
 
 `PUSH_THRESHOLD` (push/pull cutoff) · `ACTIVE_SAMPLE` (active-set size) ·
 `WHALE_MEMBERS` · `DRAIN_BATCH` / `RELAY_BATCH` / `RELAY_POLL_MS` ·
-`LOAD_RATE` / `LOAD_SECONDS` / `LOAD_CLUB`.
+`DIGEST_WINDOW_MS` (coalesce window, default 5000) · `DIGEST_POLL_MS` (scheduler
+tick) · `IMMEDIATE_TYPES` (comma-separated high-priority types that skip the
+digest, e.g. `match_start`; default empty) · `LOAD_RATE` / `LOAD_SECONDS` /
+`LOAD_CLUB`.
+
+### Re-running from a clean slate
+
+`make reset` wipes the MySQL volume, drops the in-memory Redis + DynamoDB state,
+rebuilds the images, and re-runs the seed. Use it before a fresh load test so all
+counters, streams, and digest state start from zero:
+
+```bash
+make reset                                  # clean stack + reseed
+make load RATE=8000 SECONDS=30 CLUB=whale   # then retest
+```
+
+(Under the hood: `docker compose down -v && docker compose up -d --build`. Redis
+runs `appendonly no` with no volume and DynamoDB runs `-inMemory`, so tearing the
+containers down clears both; only MySQL has a volume, which `-v` removes.)

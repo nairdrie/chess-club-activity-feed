@@ -19,12 +19,18 @@ const redis = makeRedis('notify');
 
 async function deliver(job: NotificationJob): Promise<void> {
   // Real delivery would call APNs/FCM/SES/websocket here. We simulate success.
+  // A digest job carries a count ("N new in {club}"); an event job is a single item.
   // (in_app could push to a per-user inbox list; kept as a counter for the demo.)
   return;
 }
 
+/** Dedupe identity: the event ULID for immediate jobs, or (club, window) for digests. */
+function dedupeKey(job: NotificationJob): string {
+  return job.kind === 'digest' ? `digest:${job.clubId}:${job.window}` : String(job.eventId);
+}
+
 async function handle(job: NotificationJob): Promise<void> {
-  const won = await claimNotification(job.userId, job.eventId, job.channel);
+  const won = await claimNotification(job.userId, dedupeKey(job), job.channel);
   if (!won) {
     bumpMetric(redis, METRIC.notifyDeduped);
     return; // already delivered by a prior/parallel attempt
