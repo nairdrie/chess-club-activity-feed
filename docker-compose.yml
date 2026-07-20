@@ -2,7 +2,7 @@
 # Chess.com Club Activity Feed — full working demo topology.
 #
 #   web ─┐
-#        ├─ lb (nginx, sticky WS) ─┬─ api1, api2        (stateless REST)
+#        ├─ lb (nginx) ─┬─ api1, api2        (stateless REST)
 #        │                         └─ rt1, rt2, rt3     (socket.io pods)
 #   loadgen (tools profile)
 #
@@ -117,24 +117,36 @@ services:
         aliases: [api]
 
   # ── realtime pods (socket.io + redis adapter) ────────────────────────────
+  # All three answer to the shared DNS alias `rt`, resolved per-connection by the
+  # LB. WebSocket-only means no sticky sessions; the redis-adapter fans broadcasts
+  # across all pods so a client on any pod still receives its rooms' events.
   rt1:
     <<: *backend
     command: ["npm", "run", "realtime"]
     environment: { <<: *backend-env, ROLE: realtime }
     depends_on:
       redis: { condition: service_healthy }
+    networks:
+      default:
+        aliases: [rt]
   rt2:
     <<: *backend
     command: ["npm", "run", "realtime"]
     environment: { <<: *backend-env, ROLE: realtime }
     depends_on:
       redis: { condition: service_healthy }
+    networks:
+      default:
+        aliases: [rt]
   rt3:
     <<: *backend
     command: ["npm", "run", "realtime"]
     environment: { <<: *backend-env, ROLE: realtime }
     depends_on:
       redis: { condition: service_healthy }
+    networks:
+      default:
+        aliases: [rt]
 
   # ── workers (scale each independently) ───────────────────────────────────
   drain:

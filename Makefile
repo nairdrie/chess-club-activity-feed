@@ -82,8 +82,9 @@ health:
 ## each replica's direct health, and a probe through the LB (expect JSON, not 404).
 diag:
 	@docker compose ps
-	@echo "\n── LB resolves 'api' to (should be the two API container IPs) ──"
+	@echo "\n── LB resolves 'api' (expect the 2 API IPs) and 'rt' (expect the 3 rt IPs) ──"
 	@docker compose exec -T lb nslookup api 2>/dev/null || true
+	@docker compose exec -T lb nslookup rt 2>/dev/null || true
 	@echo "── API replicas, probed directly (expect {\"ok\":true...}) ──"
 	@docker compose exec -T lb sh -c 'for h in api1 api2; do printf "%s: " $$h; wget -qO- http://$$h:8080/health || echo FAIL; echo; done' || true
 	@echo "── /api/health through the LB (expect JSON, not 404) ──"

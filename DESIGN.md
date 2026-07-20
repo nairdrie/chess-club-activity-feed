@@ -28,7 +28,7 @@ ScyllaDB** (identical key schema), **Compose → k8s Deployments + HPA**.
 
 ```mermaid
 flowchart TB
-  UI[Web + mobile client] -->|REST| LB[LB - sticky WS]
+  UI[Web + mobile client] -->|REST| LB[LB]
   UI <-->|socket.io| LB
   LB --> API[API replicas]
   LB --> RT[socket.io pods x3 + redis adapter]

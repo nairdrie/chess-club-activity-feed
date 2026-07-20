@@ -33,7 +33,8 @@ async function main() {
 
   const io = new Server(httpServer, {
     cors: { origin: '*' },
-    // long-polling fallback works because the LB pins sessions (sticky).
+    // Clients connect WebSocket-only (no sticky sessions needed); we still accept
+    // polling here so a direct/debug client works, but the LB path is WS.
     transports: ['websocket', 'polling'],
   });
   io.adapter(createAdapter(pub, sub));

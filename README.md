@@ -42,7 +42,7 @@ make load                    # spec profile: 5k/s avg, 20k/s peak, 30s, into a 5
 
 Everything runs in Docker Compose: 3 socket.io pods, 2 API replicas, 5 worker
 types (drain, relay, fanout, digest, notify), Redis, MySQL, dynamodb-local, and an
-nginx LB with sticky WebSocket sessions. `make up` starts the workers at the demo's
+nginx LB (WebSocket-only realtime, no sticky sessions). `make up` starts the workers at the demo's
 default scale (`fanout=3 drain=2 notify=3 digest=2` — see
 [§ Scaling the demo](#scaling-the-demo-how-we-picked-the-worker-counts)); scale any
 worker further with `docker compose up -d --scale fanout=6`.
@@ -59,7 +59,7 @@ the worst case: one club, maximum fan-out, no spreading to soften it.
 | Layer | Tech (local) | Role |
 |---|---|---|
 | Frontend | React + TS + Vite | chess.com-style shell, cursor infinite-scroll feed, live socket updates + REST backfill |
-| Edge | nginx | LB: round-robin API, **sticky** socket.io, static SPA |
+| Edge | nginx | LB: round-robin API + WebSocket-only socket.io (per-request DNS resolve), static SPA |
 | Realtime | socket.io ×3 pods + `@socket.io/redis-adapter` | one room per `club:{id}`, cross-pod broadcast |
 | API | Node + TS + Express (×2) | stateless: ingest, feed reads, preference CRUD, metrics |
 | Write buffer | Redis Streams (`stream:ingest`) | O(1) pipeline buffer, **the spike absorber** |
@@ -138,7 +138,7 @@ flowchart TB
   subgraph client[Client]
     UI[React feed UI]
   end
-  UI -->|REST /api| LB[nginx LB - sticky WS]
+  UI -->|REST /api| LB[nginx LB]
   UI <-->|socket.io| LB
 
   LB --> API[API replicas x2]
@@ -517,7 +517,7 @@ server/                Node+TS, one image, many roles (tsx, no build step)
   src/loadgen/         producer+consumer load test (prints the guarantees)
   src/seed.ts          clubs, memberships, active sets, feed history
 web/                   React+TS+Vite chess.com-style UI
-infra/nginx/lb.conf    edge LB (sticky WS)
+infra/nginx/lb.conf    edge LB (per-request DNS resolve)
 docker-compose.yml     3 rt pods · 2 api · workers · redis · mysql · dynamodb · lb
 Makefile               up / down / load / scale / logs
 ```
@@ -556,13 +556,16 @@ whatever now holds the old IP — often an `rt` pod, which listens on the same p
 and returns a bare `404` for everything except `/health` — so the LB round-robins
 between a real API (`200`) and an rt pod (`404`).
 
-This is fixed structurally: the LB no longer uses a static `upstream` for the API.
-The two replicas share a Docker DNS alias `api` (see `docker-compose.yml` networks),
-and `lb.conf` resolves it **per request** via Docker's resolver (`127.0.0.11`,
-`valid=10s`), so the `/api` path always lands on a live API and picks up IP changes
-within seconds. `make up`/`reset` also pass `--remove-orphans` (kill leftover
-containers from older topologies) and refresh the LB for the still-static, sticky
-`rt` pool.
+This is fixed structurally for **both** `/api` and `/socket.io`: the LB uses no
+static `upstream` for them. Each replica set shares a Docker DNS alias (`api` →
+api1+api2, `rt` → rt1+rt2+rt3; see `docker-compose.yml` networks), and `lb.conf`
+resolves that alias **per request/connection** via Docker's resolver (`127.0.0.11`,
+`valid=10s`), so a path can only land on the right service and new IPs are picked up
+within seconds. `/api` also retries the other replica (`proxy_next_upstream`) as a
+belt-and-braces guard. The socket is **WebSocket-only** (client + LB), which removes
+the sticky-session (`ip_hash`) requirement that made `rt` prone to the same stale-IP
+handshake failures ("Reconnecting..."). `make up`/`reset` also pass `--remove-orphans`
+and refresh the LB.
 
 If you ever suspect routing, `make diag` prints what `api` resolves to, each
 replica's direct health, and a probe through the LB.
