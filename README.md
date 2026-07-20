@@ -12,14 +12,20 @@ so the design decisions are *studyable by doing* — including a load generator
 whose headline output is a counter that proves **zero loss and zero duplication
 under load**.
 
-> This demo is built from technologies I've run in production. Every "local"
-> choice has a documented **drop-in swap** for Chess.com scale (Redis Streams→Kafka,
-> DynamoDB-local→ScyllaDB). Those annotations are in [§ Swaps at scale](#swaps-at-scale) —
-> they're the interview cheat sheet.
+> Built from tech I've run in production (React, Node, Redis, DynamoDB, WebSockets).
+> Every choice has a documented **swap** — for scale (Redis Streams→Kafka,
+> dynamodb-local→ScyllaDB) or to align with Chess.com's platform
+> (Node→PHP/Symfony, React→Vue, ECS→k8s). The outbox + read-model boundaries keep
+> each swap localized. See [§ Swaps at scale](#swaps-at-scale).
 
 > 📄 **The one-page design deliverable is [`DESIGN.md`](./DESIGN.md)** — component
 > diagram, sequence flow, API sketch (OpenAPI + Protobuf), frontend note, AI-agent
 > note. This README is the deep-dive / run guide behind it.
+
+> ⚠️ **Real vs. designed:** the core pipeline and its guarantees are implemented and
+> load-tested end-to-end; several refinements in the design (notification digesting,
+> cache read-throughs, DLQ policy) are **designed but not yet wired**. Honest status
+> and TODOs are in [§ Implemented vs. designed](#implemented-vs-designed-honest-status--todos).
 
 ---
 
@@ -53,6 +59,58 @@ sessions. Scale any worker: `docker compose up -d --scale fanout=3 --scale drain
 | Feed store | dynamodb-local | `user_feed` (push) + `club_timeline` (pull); **ScyllaDB at scale** |
 | Notifications | Redis Streams + Dynamo conditional write | separate consumer group, **exactly-once**, DLQ |
 | Cache | Redis sorted sets | hot-feed pages, `noeviction` |
+
+---
+
+## Implemented vs. designed (honest status & TODOs)
+
+The design (see [`DESIGN.md`](./DESIGN.md)) is a bit ahead of the code. The **core
+pipeline and its guarantees are fully implemented and load-tested**; several
+optimizations and hardening steps are **designed but not yet wired**. Calling this
+out explicitly so nothing here reads as more finished than it is.
+
+**✅ Implemented & verified end-to-end**
+- Write path: `POST /events` → Redis ingest buffer → **drain** (event + outbox in one
+  MySQL tx, `XACK` after commit) → **relay** (`FOR UPDATE SKIP LOCKED` → publish) → **fanout**.
+- Fanout: **always** appends `club_timeline` (authoritative log) **+** materializes
+  `user_feed` for **active** members of push clubs (Redis `SINTER`).
+- Read path: **push/pull merge** (`user_feed` + each club's `club_timeline`), dedupe,
+  cursor pagination (`before`/`after`). Inactive-member completeness **verified**.
+- Realtime: **3 socket.io pods + Redis adapter**, thin payload, client REST backfill.
+- Notifications: preference-filtered enqueue, **exactly-once** dedupe (conditional
+  write on `(user, event, channel)`), separate consumer group + DLQ.
+- Guarantees: **load generator proves 0 lost / 0 duplicate** under load; buffer-depth /
+  drain-rate / e2e-latency metrics. Docker Compose (3 rt · 2 api · workers · nginx LB).
+- Frontend: chess.com-style feed, infinite scroll, live updates, simulate-event, live guarantees widget.
+
+**🚧 Designed but NOT yet implemented (TODOs)**
+1. **Hot-page ZSET cache is write-only.** Fanout populates `cache:feed:{user}`, but the
+   read path queries DynamoDB directly. *TODO: `ZREVRANGE`-first read-through + Dynamo fallback + warm-on-miss.*
+2. **Notification digesting is design-only.** The code enqueues one immediate notification
+   per (active member × event). *TODO: `HINCRBY` digest counters + due-set ZSET + scheduler +
+   "N new in {club}" summaries + the high-priority/immediate bypass.*
+3. **Notification audience is a simplification.** The code notifies only **active** members;
+   push/email should reach **preference-enabled members regardless of activity** (bounded by
+   digesting). *TODO: split feed-materialization audience (active) from notification audience (preference-enabled).*
+4. **`user:{id}:clubs` cache not built.** The feed read resolves the user's clubs via a MySQL
+   join. *TODO: cache-aside in Redis + invalidate on join/leave.*
+5. **Preferences read-through missing.** Prefs are write-through cached; on a cache miss
+   fanout applies a default instead of reading MySQL. *TODO: read-through on miss.*
+6. **DLQ policy is naive.** The notify worker DLQs on **any** delivery failure. *TODO: circuit
+   breaker + transient (hold/retry) vs. permanent (DLQ) classification + an idempotency-key-with-status
+   reaper for the claim-then-crash gap.*
+7. **Read path over-merges.** It merges **every** club's timeline each read (correct but not
+   read-efficient). *TODO: activity-aware read — serve active users from `user_feed`/cache, merge
+   only pull timelines, reconstruct on return.*
+8. **Per-club whale timeline cache not built** (one shared cache entry for all members of a hot
+   club — the biggest read-offload for whales). *TODO.*
+9. **Delivery is simulated.** `deliver()` is a no-op; no real APNs / FCM / SES.
+
+**Intentional demo substitutions** (documented swaps, not gaps): Redis Streams *is* the
+event log (Kafka at scale); dynamodb-local *is* the feed store (managed DynamoDB / ScyllaDB
+at scale); Docker Compose *is* the orchestration (ECS/k8s + autoscaling at scale). The
+`ACTIVE_SAMPLE` env bounds the active set so a "500k" whale runs on a laptop while exercising
+the exact production code path.
 
 ---
 
@@ -273,16 +331,25 @@ Everything here is deliberately swappable. The point of the demo is that the
 - **dynamodb-local → ScyllaDB (or DynamoDB).** `user_feed` (PK `USER#id`, SK
   ULID, TTL, capped) and `club_timeline` (PK `CLUB#id#day`, SK ULID) map 1:1 to
   Scylla wide-partition tables. Key schema, day-bucketing, and TTL are identical;
-  only the driver changes. Scylla is Chess.com's fit for the write volume + p99.
+  only the driver changes. A wide-column store (Scylla/Cassandra) fits the write
+  volume + p99; on AWS it's a config-only swap to managed DynamoDB.
 - **MySQL → same MySQL, bigger.** The durable core + outbox is intentionally
   boring and relational. Shard by `club_id` if the write path outgrows one
   primary; the outbox pattern is shard-local.
 - **Redis (single) → Redis Cluster, with the dedupe/idempotency instance on
   `noeviction`.** LRU eviction on the dedupe keys would let a redelivery slip
   through as a duplicate, so that instance must never evict.
-- **Docker Compose → Kubernetes.** Each compose service is a Deployment; API and
-  workers get an HPA (queue-depth / CPU); the LB becomes an ingress with sticky
-  sessions; Redis/MySQL/Scylla are managed/operated.
+- **Docker Compose → ECS/Fargate (what I've run) or k8s (Chess.com's platform).**
+  Each compose service becomes a Deployment/Service with autoscaling (queue-depth /
+  CPU — scale the WS tier on **connection count**, not CPU); the LB becomes an
+  ingress/ALB with sticky sessions; Redis/MySQL/Scylla are managed/operated. The
+  compose topology maps 1:1 either way.
+- **Platform-fit alignment (Chess.com stack).** These services are Node/TS and the
+  client is React because that's what I've run in production — the architecture is
+  language-agnostic, so the natural alignment is **Node → PHP/Symfony** and
+  **React → Vue**. The design (streams, outbox, push/pull, dedupe) is unchanged; it
+  just lives in your framework's handlers. The Docker/observability surface maps to
+  your **k8s + telemetry/dashboards** workflow.
 
 ---
 
