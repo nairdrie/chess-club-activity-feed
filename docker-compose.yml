@@ -19,6 +19,11 @@
 
 x-backend: &backend
   build: ./server
+  # One shared image for every backend role (api / rt / workers / seed / loadgen).
+  # Without this each service builds its OWN image tag, and since loadgen is in the
+  # `tools` profile it's skipped by `up --build` — so loadgen silently runs stale
+  # code. A single tag means one rebuild updates all of them consistently.
+  image: chess-club-feed-server:local
   restart: unless-stopped
   environment: &backend-env
     REDIS_URL: redis://redis:6379

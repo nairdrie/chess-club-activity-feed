@@ -65,6 +65,7 @@ seed:
 ## Defaults to the spec profile (5k avg, 20k peak, 30s, whale). Override any:
 ##   make load RATE=5000 PEAK=20000 SECONDS=30 CLUB=whale PEAK_AT=15
 load:
+	docker compose build loadgen
 	LOAD_RATE=$(RATE) LOAD_PEAK=$(PEAK) LOAD_SECONDS=$(SECONDS) LOAD_CLUB=$(CLUB) LOAD_PEAK_AT=$(PEAK_AT) \
 		docker compose run --rm loadgen
 
