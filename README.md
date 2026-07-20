@@ -8,9 +8,9 @@ web and mobile, and optionally fires a notification per the member's preferences
 The hard part is scale: **~5k events/sec average, ~20k/sec peak, a single event
 fanning out to up to ~500k members**, feeds that feel instant, and notifications
 that are **never lost or duplicated**. This repo builds the whole path end-to-end
-so the design decisions are *studyable by doing*, including a load generator
-whose headline output is a counter that proves **zero loss and zero duplication
-under load**.
+so the design can be run and measured rather than just described, including a
+load generator whose headline output is a counter that proves **zero loss and
+zero duplication under load**.
 
 > Built from tech I've run in production (React, Node, Redis, DynamoDB, WebSockets).
 > Every choice has a documented **swap** for scale (Redis Streams→Kafka,
@@ -301,7 +301,7 @@ make load RATE=3000 SECONDS=20 CLUB=small   # small = PUSH path
 
 ### What's proven vs. what scales to target
 
-Be precise about the claim: this demo **proves the mechanism and the guarantees**: zero loss, zero duplication, spike absorbed by the buffer, latency dropping as
+Stated precisely, this demo **proves the mechanism and the guarantees**: zero loss, zero duplication, spike absorbed by the buffer, latency dropping as
 workers scale, not the literal 20k/s number. A single load-generator process
 tops out around ~1k/s (Node `fetch` client-side, not a pipeline limit). The
 **5k/s-avg, 20k/s-peak targets are met by design**: partition the log by
@@ -314,7 +314,7 @@ watch buffer depth rise and drain while duplicates/lost stay at 0.
 ---
 
 <a name="swaps-at-scale"></a>
-## Swaps at scale (the cheat sheet)
+## Swaps at scale
 
 Everything here is deliberately swappable. The point of the demo is that the
 *shape* is production-correct; only the managed backing service changes.
