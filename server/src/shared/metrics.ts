@@ -7,6 +7,11 @@ export function bumpMetric(redis: Redis, key: string, by = 1): void {
   redis.incrby(key, by).catch(() => {});
 }
 
+/** Gauge (SET, last-write-wins) — used for the per-stage lag readings. */
+export function setGauge(redis: Redis, key: string, value: number): void {
+  redis.set(key, String(Math.max(0, Math.round(value)))).catch(() => {});
+}
+
 export async function readAllMetrics(redis: Redis): Promise<Record<string, number>> {
   const names = Object.values(METRIC);
   const vals = await redis.mget(...names);

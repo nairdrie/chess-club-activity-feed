@@ -88,12 +88,21 @@ export function useFeed(): UseFeed {
     backfillInFlight.current = true;
     try {
       const after = newestCursorRef.current;
-      const page = await getFeed({
+      let page = await getFeed({
         userId: currentMe.userId,
         limit: PAGE_SIZE,
         // If we have no cursor yet, this returns the newest page.
         ...(after ? { after } : {}),
       });
+      // Catch-up guard: a FULL after-window means we may be far behind (e.g. a
+      // load test poured in thousands of items and the cursor is stranded
+      // mid-backlog). Crawling forward a page at a time would take thousands of
+      // round-trips and stall the moment activity frames stop. Standard feed
+      // behavior instead: jump to the head — fetch the newest page and resume
+      // from there (prependItems dedupes any overlap and resets the cursor).
+      if (after && page.items.length >= PAGE_SIZE) {
+        page = await getFeed({ userId: currentMe.userId, limit: PAGE_SIZE });
+      }
       prependItems(page.items);
     } catch {
       // transient; next activity/reconnect will retry

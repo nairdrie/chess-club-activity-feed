@@ -416,6 +416,27 @@ docker compose up -d --scale fanout=1 --scale drain=1 --scale notify=1 --scale d
 make load
 ```
 
+### Diagnosing latency: stage-lag gauges
+
+e2e latency alone can't tell you *which* worker to scale, so the pipeline exports
+two stage-lag gauges (oldest-event age at stage completion, worst-of-batch):
+
+- `lagDrain` — ingest → durable in MySQL (the spike-absorber depth in ms)
+- `lagFanout` — ingest → fanned out (feed written + realtime emitted)
+
+`make load` prints them live (`stage lag drain=…ms fanout=…ms`) and the report
+prints the peaks; the UI widget shows them too. Read them like this: if
+`lagDrain` is high, scale **drain** (or MySQL is the limit); if `lagDrain` is low
+but `lagFanout` is high, the queueing is in relay/fanout — scale **fanout**. On a
+single laptop, scaling past the physical core count stops helping; the gauges make
+that visible too (lags plateau instead of dropping).
+
+One measurement caveat from this project's own history: a run during the broken-LB
+period showed ~180ms average — that number was *not* a better configuration, it was
+a throttled pipeline (many POSTs failing fast at the LB meant far less inflow, so
+no queueing). Always sanity-check `fired` and `drained→db` match before comparing
+latency numbers across runs.
+
 ---
 
 <a name="swaps-at-scale"></a>

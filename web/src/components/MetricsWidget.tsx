@@ -18,6 +18,8 @@ const SERVER_FIELDS: { key: string; label: string; highlight?: boolean }[] = [
   { key: 'notifyDelivered', label: 'Notifications' },
   { key: 'notifyDeduped', label: 'Deduped (exactly-once)', highlight: true },
   { key: 'bufferDepth', label: 'Buffer depth', highlight: true },
+  { key: 'lagDrain', label: 'Drain lag (ms)' },
+  { key: 'lagFanout', label: 'Fanout lag (ms)' },
 ];
 
 function fmt(n: number): string {

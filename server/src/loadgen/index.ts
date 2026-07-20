@@ -100,6 +100,8 @@ function bar(label: string, value: string) {
 }
 
 let maxBuffer = 0;
+let maxLagDrain = 0;
+let maxLagFanout = 0;
 
 async function main() {
   console.log(`\n⚡ Load generator → club=${CLUB}  avg=${RATE}/s  peak=${PEAK}/s @${PEAK_AT}s  duration=${SECONDS}s  target=${HTTP}\n`);
@@ -130,6 +132,8 @@ async function main() {
     const m = await getMetrics();
     const now = Date.now();
     maxBuffer = Math.max(maxBuffer, m.bufferDepth ?? 0);
+    maxLagDrain = Math.max(maxLagDrain, m.lagDrain ?? 0);
+    maxLagFanout = Math.max(maxLagFanout, m.lagFanout ?? 0);
     const drained = m.drained ?? 0;
     const drainRate = Math.round(((drained - prevDrained) / (now - prevT)) * 1000);
     prevDrained = drained;
@@ -154,6 +158,7 @@ async function main() {
     console.log(bar('notify delivered', String(m.notifyDelivered ?? 0)) + '   (immediate + digests)');
     console.log('');
     console.log(bar('e2e latency', `last=${lastLatency}ms avg=${avgLat}ms max=${latMax}ms`));
+    console.log(bar('stage lag', `drain=${m.lagDrain ?? 0}ms  fanout=${m.lagFanout ?? 0}ms`) + '   (who is the queue?)');
     console.log('');
     console.log('── guarantees ' + '─'.repeat(30));
     console.log(bar('dup feed items', '0  ✅') + '   (deduped by ULID)');
@@ -196,6 +201,7 @@ async function main() {
   console.log(bar('delivered (realtime)', String(received.size)));
   console.log('');
   console.log(bar('end-to-end latency', `avg=${latN ? Math.round(latSum / latN) : 0}ms  max=${latMax}ms`));
+  console.log(bar('peak stage lag', `drain=${maxLagDrain}ms  fanout=${maxLagFanout}ms`) + '   (scale the dominant stage)');
   console.log(bar('peak buffer depth', String(maxBuffer)) + '   (spike absorbed here)');
   console.log(bar('final buffer depth', String(m.bufferDepth ?? 0)));
   console.log(bar('drained→db', String(m.drained ?? 0)));

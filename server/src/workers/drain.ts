@@ -4,7 +4,7 @@ import { makeRedis } from '../shared/redis.js';
 import { getPool, waitForMysql, ensureSchema } from '../shared/mysql.js';
 import { runStreamConsumer } from '../shared/consumer.js';
 import { STREAM_INGEST, GROUP_DRAIN, METRIC } from '../shared/keys.js';
-import { bumpMetric } from '../shared/metrics.js';
+import { bumpMetric, setGauge } from '../shared/metrics.js';
 import type { ActivityEvent } from '../shared/types.js';
 
 /**
@@ -40,6 +40,9 @@ async function persist(events: ActivityEvent[]): Promise<void> {
     );
     await conn.commit();
     bumpMetric(metrics, METRIC.drained, events.length);
+    // Stage lag: how stale was the oldest event in this batch when it became
+    // durable? (ingest -> drain queueing, the spike-absorber depth in ms.)
+    setGauge(metrics, METRIC.lagDrain, Date.now() - Math.min(...events.map((e) => e.createdAt)));
   } catch (err) {
     await conn.rollback();
     throw err; // do not ACK — entries stay pending and get retried/reclaimed

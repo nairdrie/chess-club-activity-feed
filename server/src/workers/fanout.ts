@@ -4,7 +4,7 @@ import { log } from '../shared/logger.js';
 import { makeRedis, waitForRedis } from '../shared/redis.js';
 import { runStreamConsumer } from '../shared/consumer.js';
 import { STREAM_EVENTS, STREAM_NOTIFY, GROUP_FANOUT, METRIC, clubMembers, ACTIVE_USERS, feedCache, userDigest, DIGEST_DUE } from '../shared/keys.js';
-import { bumpMetric } from '../shared/metrics.js';
+import { bumpMetric, setGauge } from '../shared/metrics.js';
 import { classifyKind } from '../shared/clubs.js';
 import {
   ensureTables,
@@ -158,6 +158,10 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
 
   bumpMetric(redis, METRIC.realtimeEmitted, events.length);
   bumpMetric(redis, METRIC.fanned, events.length);
+  // Stage lag: oldest event's age at fanout completion. Compare with lagDrain:
+  // fanoutLag - drainLag ≈ time queued in outbox/relay/stream:events — the
+  // difference tells you which worker to scale.
+  setGauge(redis, METRIC.lagFanout, Date.now() - Math.min(...events.map((e) => e.createdAt)));
   if (materialized) bumpMetric(redis, METRIC.materialized, materialized);
   if (timelineWrites) bumpMetric(redis, METRIC.timelineWrites, timelineWrites);
   if (notifyEnqueued) bumpMetric(redis, METRIC.notifyEnqueued, notifyEnqueued);

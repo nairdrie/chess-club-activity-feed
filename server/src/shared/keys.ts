@@ -52,4 +52,9 @@ export const METRIC = {
   notifyDeduped: 'metrics:notify_deduped', // exactly-once blocks (the claim-race fix)
   notifyDlq: 'metrics:notify_dlq',
   realtimeEmitted: 'metrics:realtime_emitted',
+  // Stage-lag gauges (ms, event createdAt -> stage completion, worst-of-batch).
+  // These decompose e2e latency so "which worker do I scale?" is answerable from
+  // data: whichever stage's lag dominates is where the queueing is.
+  lagDrain: 'metrics:lag:drain',
+  lagFanout: 'metrics:lag:fanout',
 } as const;
