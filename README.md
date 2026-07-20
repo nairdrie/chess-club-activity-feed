@@ -534,20 +534,21 @@ containers down clears both; only MySQL has a volume, which `-v` removes.)
 
 ### Troubleshooting: intermittent 404 on `/api/*`
 
-If `/api/metrics` (or any API call) flips between `200` and `404` at random, the
-nginx LB is holding **stale backend IPs**. Open-source nginx resolves the
-`upstream { server api1; ... }` hostnames **once at startup** and caches the IPs.
-A `docker compose up --build` (or a scale) recreates `api1`/`api2`/`rt*` with new
-IPs, but the `lb` container (stock nginx image, unchanged) is **not** recreated, so
-it round-robins `/api` to whatever now holds the old IP — often an `rt` pod, which
-listens on the same port and returns a bare `404` for everything except `/health`.
+Symptom: `/api/metrics` and `/api/feed` flip between `200` and `404` at random (a
+clean ~50/50 split). Cause: open-source nginx resolves `upstream { server api1; }`
+hostnames **once at startup** and caches the IPs. A `docker compose up --build` (or
+scale) recreates the API/rt containers with new IPs; the stale entry then points at
+whatever now holds the old IP — often an `rt` pod, which listens on the same port
+and returns a bare `404` for everything except `/health` — so the LB round-robins
+between a real API (`200`) and an rt pod (`404`).
 
-Fix: recreate just the LB so it re-resolves DNS.
+This is fixed structurally: the LB no longer uses a static `upstream` for the API.
+The two replicas share a Docker DNS alias `api` (see `docker-compose.yml` networks),
+and `lb.conf` resolves it **per request** via Docker's resolver (`127.0.0.11`,
+`valid=10s`), so the `/api` path always lands on a live API and picks up IP changes
+within seconds. `make up`/`reset` also pass `--remove-orphans` (kill leftover
+containers from older topologies) and refresh the LB for the still-static, sticky
+`rt` pool.
 
-```bash
-make lb-refresh                                   # or:
-docker compose up -d --force-recreate --no-deps lb
-```
-
-`make up` / `make reset` / `make scale` now do this automatically as their last
-step, so you only hit this if you drive `docker compose` directly.
+If you ever suspect routing, `make diag` prints what `api` resolves to, each
+replica's direct health, and a probe through the LB.

@@ -10,11 +10,11 @@ PEAK_AT ?=
 # single-node bottleneck is fanout + notify, so we run those wide by default.
 SCALE_FLAGS = --scale fanout=3 --scale drain=2 --scale notify=3 --scale digest=2
 
-.PHONY: up down logs ps seed load rebuild clean reset scale health lb-refresh
+.PHONY: up down logs ps seed load rebuild clean reset scale health lb-refresh diag
 
 ## Bring the whole stack up at the demo's default scale (builds on first run).
 up:
-	docker compose up -d --build $(SCALE_FLAGS)
+	docker compose up -d --build --remove-orphans $(SCALE_FLAGS)
 	$(MAKE) --no-print-directory lb-refresh
 	@echo "\n➡  UI:       http://localhost:8080"
 	@echo "➡  Metrics:  http://localhost:8080/api/metrics"
@@ -43,8 +43,8 @@ clean:
 ##   make reset            # keep current images if unchanged
 ##   make reset ARGS=--build   # force an image rebuild too
 reset:
-	docker compose down -v
-	docker compose up -d --build $(SCALE_FLAGS)
+	docker compose down -v --remove-orphans
+	docker compose up -d --build --remove-orphans $(SCALE_FLAGS)
 	$(MAKE) --no-print-directory lb-refresh
 	@echo "\n✔ clean stack up (fanout=3 drain=2 notify=3 digest=2) and re-seeded."
 	@echo "➡  UI:       http://localhost:8080"
@@ -77,6 +77,17 @@ scale:
 health:
 	@curl -s http://localhost:8080/api/health | sed 's/^/api: /'
 	@echo ""
+
+## Diagnose LB → backend routing if /api/* is flaky: what `api` resolves to,
+## each replica's direct health, and a probe through the LB (expect JSON, not 404).
+diag:
+	@docker compose ps
+	@echo "\n── LB resolves 'api' to (should be the two API container IPs) ──"
+	@docker compose exec -T lb nslookup api 2>/dev/null || true
+	@echo "── API replicas, probed directly (expect {\"ok\":true...}) ──"
+	@docker compose exec -T lb sh -c 'for h in api1 api2; do printf "%s: " $$h; wget -qO- http://$$h:8080/health || echo FAIL; echo; done' || true
+	@echo "── /api/health through the LB (expect JSON, not 404) ──"
+	@docker compose exec -T lb sh -c 'wget -qO- http://localhost/api/health; echo' || true
 
 rebuild:
 	docker compose build

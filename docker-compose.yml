@@ -98,14 +98,23 @@ services:
       dynamodb: { condition: service_started }
 
   # ── API replicas (stateless) ─────────────────────────────────────────────
+  # Both answer to the shared DNS alias `api`, so the LB can round-robin them
+  # via Docker DNS (resolved per-request) instead of caching a fixed IP. This is
+  # what stops the intermittent /api 404 after a rebuild/scale.
   api1:
     <<: *backend
     command: ["npm", "run", "api"]
     environment: { <<: *backend-env, ROLE: api }
+    networks:
+      default:
+        aliases: [api]
   api2:
     <<: *backend
     command: ["npm", "run", "api"]
     environment: { <<: *backend-env, ROLE: api }
+    networks:
+      default:
+        aliases: [api]
 
   # ── realtime pods (socket.io + redis adapter) ────────────────────────────
   rt1:
