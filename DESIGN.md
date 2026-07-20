@@ -183,8 +183,9 @@ matter what the agent refactors underneath.
 ## Guarantees & scale
 
 Exactly-once (idempotent sinks: ULID-keyed feed writes + conditional-write notify
-dedupe) and no-loss (transactional outbox + ACK-after-commit) are **proven by a
-load generator that reports duplicates and lost events — both 0**. Per-club
+dedupe + an emit-once `SET NX` guard so a reprocessed event never double-fires the
+realtime frame) and no-loss (transactional outbox + ACK-after-commit) are **proven
+by a load generator that reports duplicates and lost events — both 0**. Per-club
 ordering via ULID + `club_id` partition. The 5k/s-avg, 20k/s-peak targets are met
 by design through partition-by-`club_id` + horizontally scaled workers/pods
 (Kafka + Scylla at scale); the demo proves the *mechanism and the guarantees* hold

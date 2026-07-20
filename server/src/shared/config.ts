@@ -64,6 +64,9 @@ export const config = {
   // feed store shape
   userFeedCap: num('USER_FEED_CAP', 500),
   feedTtlDays: num('FEED_TTL_DAYS', 30),
+  // How long the realtime emit-once guard remembers an event id. Only needs to
+  // outlive the redelivery/reclaim window (idle-reclaim + a settle margin).
+  emitDedupeTtlSec: num('EMIT_DEDUPE_TTL_SEC', 3600),
 
   // seed sizes
   whaleMembers: num('WHALE_MEMBERS', 500000),

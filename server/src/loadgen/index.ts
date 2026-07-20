@@ -196,6 +196,7 @@ async function main() {
   console.log(bar('final buffer depth', String(m.bufferDepth ?? 0)));
   console.log(bar('drained→db', String(m.drained ?? 0)));
   console.log(bar('fanned', String(m.fanned ?? 0)));
+  console.log(bar('reprocessed', String(Math.max(0, (m.fanned ?? 0) - (m.drained ?? 0)))) + '   (at-least-once, emit-deduped)');
   console.log(bar('digest folded', String(m.digestCoalesced ?? 0)));
   console.log(bar('digest summaries', String(m.digestFlushed ?? 0)));
   console.log(bar('notify delivered', String(m.notifyDelivered ?? 0)));

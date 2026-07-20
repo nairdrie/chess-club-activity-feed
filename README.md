@@ -307,6 +307,16 @@ through the REST read path** (`GET /feed?after=cursor`). On reconnect it does th
 same `after`-cursor backfill, then resumes the stream, no gaps, no full objects
 on the wire.
 
+**Emit-once.** The pipeline is at-least-once, so fanout can *reprocess* an event
+(e.g. a reclaimed pending batch from a replica that fell behind during a spike).
+The durable sinks absorb that idempotently (ULID-keyed feed writes, conditional-
+write notify dedupe), but the socket emit would otherwise double-fire. So each
+processing does a `SET emit:{eventId} NX`; only the winner broadcasts the frame. A
+redelivery loses the claim and skips the emit — and since the event is already in
+the durable feed, a rare skipped frame is recovered by the client's `after`-cursor
+backfill. That's what keeps the load generator's duplicate count at 0 even when
+`fanned` exceeds the unique event count (reprocessing happened, but was absorbed).
+
 ---
 
 ## Guarantees, made observable
