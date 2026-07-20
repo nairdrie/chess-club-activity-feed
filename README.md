@@ -385,13 +385,24 @@ Little's Law, `L = λ × W`, holding arrival rate λ fixed and cutting the time-
 system W means draining the queue faster, which is exactly what parallel consumers
 in the same consumer group do (Redis splits pending entries across them). So:
 
-- **fanout ×3** — the heaviest stage (Dynamo batch writes + fan-out); the biggest
-  single latency lever.
+- **fanout ×6** (default) — the heaviest stage, and the **stage-lag gauges prove
+  it**: a 5k/20k whale run shows `fanout` lag ≈ the whole e2e latency while `drain`
+  lag is ~0. It's the biggest lever, so it runs widest. Override with
+  `make up FANOUT=8` (or `make scale FANOUT=8`) and watch `peak stage lag fanout=…`
+  fall — until it plateaus at the single-node backend ceiling (see below).
 - **drain ×2** — keeps the MySQL persist off the critical path so buffer depth
-  drains during the 20k spike instead of backing up.
+  drains during the 20k spike instead of backing up. Gauge confirms it's not the
+  bottleneck (drain lag ~100ms).
 - **notify ×3** — the notification sink was the deepest backlog pre-digest.
 - **digest ×2** — cheap; two schedulers share the due-set safely (atomic `ZREM`
   claim), so windows flush promptly even under load.
+
+**The plateau is the point.** Past a handful of fanout replicas the lag stops
+dropping: all replicas share one Redis (the digest `HINCRBY`/`ZADD` per active
+member) and one `dynamodb-local` (timeline writes), both single-process here. That
+ceiling *is* the demo's honest limit — and it's exactly what the documented swaps
+remove: managed DynamoDB / ScyllaDB and a Redis cluster (or Kafka) scale those
+backends horizontally, so fanout replicas keep buying latency past what a laptop can.
 
 **Two things changed since that study, both of which only help:**
 1. **Digesting** (this iteration) removes the notification amplification that made

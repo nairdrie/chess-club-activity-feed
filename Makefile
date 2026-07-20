@@ -6,9 +6,17 @@ SECONDS ?= 30
 CLUB    ?= whale
 PEAK_AT ?=
 
-# Default worker fan-out for the demo (see README "Scaling the demo"): the
-# single-node bottleneck is fanout + notify, so we run those wide by default.
-SCALE_FLAGS = --scale fanout=3 --scale drain=2 --scale notify=3 --scale digest=2
+# Per-worker replica counts (override on the CLI, e.g. `make up FANOUT=8`).
+# Fanout is the dominant stage under the whale load (the stage-lag gauges show
+# fanout lag ~= total e2e latency, drain lag ~= 0), so it runs widest. Push it
+# higher and watch `peak stage lag fanout=…` drop until it plateaus — the plateau
+# is the single-node backend ceiling (Redis + dynamodb-local), which is exactly
+# what managed Dynamo / Kafka+Scylla remove at scale.
+FANOUT ?= 6
+DRAIN  ?= 2
+NOTIFY ?= 3
+DIGEST ?= 2
+SCALE_FLAGS = --scale fanout=$(FANOUT) --scale drain=$(DRAIN) --scale notify=$(NOTIFY) --scale digest=$(DIGEST)
 
 .PHONY: up down logs ps seed load rebuild clean reset scale health lb-refresh diag
 
@@ -19,7 +27,7 @@ up:
 	@echo "\n➡  UI:       http://localhost:8080"
 	@echo "➡  Metrics:  http://localhost:8080/api/metrics"
 	@echo "➡  Load:     make load            # 5k avg / 20k peak, 30s, whale"
-	@echo "➡  Scale:    workers default to fanout=3 drain=2 notify=3 digest=2\n"
+	@echo "➡  Scale:    fanout=$(FANOUT) drain=$(DRAIN) notify=$(NOTIFY) digest=$(DIGEST)  (override: make up FANOUT=8)\n"
 
 ## Recreate ONLY the nginx LB so it re-resolves backend container IPs via Docker
 ## DNS. Open-source nginx resolves `upstream { server api1; ... }` names once at
@@ -46,7 +54,7 @@ reset:
 	docker compose down -v --remove-orphans
 	docker compose up -d --build --remove-orphans $(SCALE_FLAGS)
 	$(MAKE) --no-print-directory lb-refresh
-	@echo "\n✔ clean stack up (fanout=3 drain=2 notify=3 digest=2) and re-seeded."
+	@echo "\n✔ clean stack up (fanout=$(FANOUT) drain=$(DRAIN) notify=$(NOTIFY) digest=$(DIGEST)) and re-seeded."
 	@echo "➡  UI:       http://localhost:8080"
 	@echo "➡  Load:     make load            # 5k avg / 20k peak, 30s, whale\n"
 
