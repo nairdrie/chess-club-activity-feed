@@ -81,6 +81,13 @@ export async function putPreferences(prefs: Preferences): Promise<Preferences> {
   return res.json();
 }
 
-export function getMetrics(): Promise<Metrics> {
-  return getJson('/metrics');
+// Metrics polls every 1s; give each one a hard timeout so a slow/overloaded API
+// during a load spike rejects promptly instead of hanging and stacking requests.
+export async function getMetrics(): Promise<Metrics> {
+  const res = await fetch(`${BASE}/metrics`, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!res.ok) throw new Error(`GET /metrics failed: ${res.status}`);
+  return res.json() as Promise<Metrics>;
 }

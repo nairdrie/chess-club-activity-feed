@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getMetrics } from '../lib/api';
 import type { ClientStats, Metrics } from '../lib/types';
 
@@ -27,6 +27,11 @@ function fmt(n: number): string {
 export function MetricsWidget({ stats }: Props) {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [reachable, setReachable] = useState(true);
+  // Tolerate transient blips: a single failed poll (e.g. the API briefly saturated
+  // during a load spike) keeps showing the last values; only after a few
+  // consecutive failures do we flag "metrics offline", so the pill stops strobing.
+  const failsRef = useRef(0);
+  const OFFLINE_AFTER = 3;
 
   useEffect(() => {
     let alive = true;
@@ -34,10 +39,13 @@ export function MetricsWidget({ stats }: Props) {
       try {
         const m = await getMetrics();
         if (!alive) return;
-        setMetrics(m);
+        setMetrics(m); // last-known values stay on screen between updates
+        failsRef.current = 0;
         setReachable(true);
       } catch {
-        if (alive) setReachable(false);
+        if (!alive) return;
+        failsRef.current += 1;
+        if (failsRef.current >= OFFLINE_AFTER) setReachable(false);
       }
     };
     void tick();

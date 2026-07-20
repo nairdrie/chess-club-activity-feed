@@ -119,13 +119,21 @@ app.put('/preferences', async (req, res) => {
 
 /** METRICS — the guarantees, made observable. Includes live buffer depth. */
 app.get('/metrics', async (_req, res) => {
-  const [m, bufferDepth, eventsBacklog, notifyBacklog] = await Promise.all([
-    readAllMetrics(redis),
-    streamLag(redis, STREAM_INGEST, GROUP_DRAIN),
-    streamLag(redis, STREAM_EVENTS, GROUP_FANOUT),
-    streamLag(redis, STREAM_NOTIFY, GROUP_NOTIFY),
-  ]);
-  ok(res, { ...m, bufferDepth, eventsBacklog, notifyBacklog });
+  // Always respond (never leave the request hanging): if Redis hiccups under a
+  // load spike, fail fast with 500 rather than letting the async handler stall
+  // until nginx 504s — a hang is what makes the UI's status pill flap.
+  try {
+    const [m, bufferDepth, eventsBacklog, notifyBacklog] = await Promise.all([
+      readAllMetrics(redis),
+      streamLag(redis, STREAM_INGEST, GROUP_DRAIN),
+      streamLag(redis, STREAM_EVENTS, GROUP_FANOUT),
+      streamLag(redis, STREAM_NOTIFY, GROUP_NOTIFY),
+    ]);
+    ok(res, { ...m, bufferDepth, eventsBacklog, notifyBacklog });
+  } catch (err) {
+    log.error('metrics read failed', { err: String(err) });
+    bad(res, 500, 'metrics read failed');
+  }
 });
 
 async function main() {
