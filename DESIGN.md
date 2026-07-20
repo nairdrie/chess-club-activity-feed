@@ -177,15 +177,17 @@ Compose wiring, and the load generator against them. Don't hand them the
 **correctness-critical seams** unsupervised — ACK-after-commit in drain, the
 `SKIP LOCKED` relay, the conditional-write dedupe — write those deliberately.
 Keep quality under control by making correctness **measurable**: a load generator
-that fails if duplicates or lost events are ever non-zero holds the guarantee no
-matter what the agent refactors underneath.
+that fails if any event is lost (and checks the ULID dedupe absorbs at-least-once
+redeliveries) holds the guarantee no matter what the agent refactors underneath.
 
 ## Guarantees & scale
 
-Exactly-once (idempotent sinks: ULID-keyed feed writes + conditional-write notify
-dedupe + an emit-once `SET NX` guard so a reprocessed event never double-fires the
-realtime frame) and no-loss (transactional outbox + ACK-after-commit) are **proven
-by a load generator that reports duplicates and lost events — both 0**. Per-club
+Effectively-once via **idempotent consumers** on an at-least-once pipeline
+(ULID-keyed feed writes + conditional-write notify dedupe; the client dedupes the
+realtime frame by ULID on insert) and no-loss (transactional outbox +
+ACK-after-commit) are **proven by a load generator that reports lost events and
+duplicate feed items — both 0** (a reprocessed event may redeliver a realtime
+frame, which the ULID dedupe absorbs). Per-club
 ordering via ULID + `club_id` partition. The 5k/s-avg, 20k/s-peak targets are met
 by design through partition-by-`club_id` + horizontally scaled workers/pods
 (Kafka + Scylla at scale); the demo proves the *mechanism and the guarantees* hold

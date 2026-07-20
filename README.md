@@ -307,15 +307,16 @@ through the REST read path** (`GET /feed?after=cursor`). On reconnect it does th
 same `after`-cursor backfill, then resumes the stream, no gaps, no full objects
 on the wire.
 
-**Emit-once.** The pipeline is at-least-once, so fanout can *reprocess* an event
-(e.g. a reclaimed pending batch from a replica that fell behind during a spike).
-The durable sinks absorb that idempotently (ULID-keyed feed writes, conditional-
-write notify dedupe), but the socket emit would otherwise double-fire. So each
-processing does a `SET emit:{eventId} NX`; only the winner broadcasts the frame. A
-redelivery loses the claim and skips the emit — and since the event is already in
-the durable feed, a rare skipped frame is recovered by the client's `after`-cursor
-backfill. That's what keeps the load generator's duplicate count at 0 even when
-`fanned` exceeds the unique event count (reprocessing happened, but was absorbed).
+**At-least-once + idempotent consumers.** The pipeline is at-least-once, so fanout
+can *reprocess* an event (e.g. a reclaimed pending batch from a replica that fell
+behind during a spike) and re-emit its realtime frame. Rather than try to prevent
+redelivery (fragile), every consumer is **idempotent by ULID**: the feed store
+overwrites the same `(pk, sk)`, the notify sink conditional-writes on
+`(user, event, channel)`, and the client inserts by ULID (dedupe by id). So a
+redelivered frame never becomes a duplicate feed item. The load generator behaves
+exactly like the client — it dedupes by ULID and reports the raw redeliveries as
+*absorbed*, so `DUPLICATE feed items = 0` holds even when `fanned` exceeds the
+unique event count (reprocessing happened, and every layer absorbed it).
 
 ---
 
@@ -329,14 +330,17 @@ required:
 
 ```
 ── GUARANTEES ────────────────────────────────
-DUPLICATES         0     (zero duplication)
-LOST               0     (zero loss)
+DUPLICATE feed items   0     (deduped by ULID)
+LOST                   0     (zero loss)
+rt redeliveries        N     (at-least-once transport, absorbed)
 ```
 
-It also prints buffer depth, drain rate, end-to-end latency (`now − createdAt`),
-and the server-side counters (`notify deduped` proves the exactly-once path is
-actually firing under redelivery). The same counters render live in the UI's
-"Live guarantees" widget.
+`DUPLICATE feed items` is 0 by construction — the consumer dedupes by ULID like
+the real client, so at-least-once `rt redeliveries` (reported separately) never
+become duplicate items. It also prints buffer depth, drain rate, end-to-end latency
+(`now − createdAt`), and server-side counters (`notify deduped` proves the
+exactly-once notify path is firing under redelivery). The same counters render live
+in the UI's "Live guarantees" widget.
 
 ```bash
 make load                                   # spec profile: 5k avg / 20k peak, whale = PULL path

@@ -37,14 +37,6 @@ export const DIGEST_DUE = 'digest:due';
 // ZSET score = ULID time, member = JSON(FeedItem). noeviction on this instance.
 export const feedCache = (userId: string) => `cache:feed:${userId}`;
 
-// ---- Realtime emit idempotency ----
-// SET NX per event id: at-least-once fanout can reprocess an event (a reclaimed
-// pending batch from a restarted replica), and the socket emit is the one
-// non-idempotent side effect. This guard makes the emit exactly-once so a
-// redelivery never produces a duplicate realtime frame. TTL-bounded; the
-// dedupe instance is noeviction so the key can't be dropped early.
-export const emitOnce = (eventId: string) => `emit:${eventId}`;
-
 // ---- Metrics counters (INCR) — the guarantees made observable ----
 export const METRIC = {
   ingested: 'metrics:ingested', // events accepted by API

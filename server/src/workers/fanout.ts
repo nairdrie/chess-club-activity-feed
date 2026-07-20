@@ -3,7 +3,7 @@ import { config } from '../shared/config.js';
 import { log } from '../shared/logger.js';
 import { makeRedis, waitForRedis } from '../shared/redis.js';
 import { runStreamConsumer } from '../shared/consumer.js';
-import { STREAM_EVENTS, STREAM_NOTIFY, GROUP_FANOUT, METRIC, clubMembers, ACTIVE_USERS, feedCache, userDigest, DIGEST_DUE, emitOnce } from '../shared/keys.js';
+import { STREAM_EVENTS, STREAM_NOTIFY, GROUP_FANOUT, METRIC, clubMembers, ACTIVE_USERS, feedCache, userDigest, DIGEST_DUE } from '../shared/keys.js';
 import { bumpMetric } from '../shared/metrics.js';
 import { classifyKind } from '../shared/clubs.js';
 import {
@@ -75,19 +75,6 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
   const allMembers = [...new Set([...membersByClub.values()].flat())];
   const prefs = await loadPrefs(allMembers);
 
-  // 2b. Emit-once claim (SET NX per event id). At-least-once fanout can reprocess
-  //     an event; the durable feed + notify sinks are idempotent, but the socket
-  //     emit is not. Whoever wins the NX for an id emits its realtime frame; a
-  //     redelivery loses the claim and skips the emit (the durable feed still has
-  //     the event, so a rare skipped frame is recovered by the client's backfill).
-  const emitClaim = redis.pipeline();
-  for (const ev of events) emitClaim.set(emitOnce(ev.id), '1', 'EX', config.emitDedupeTtlSec, 'NX');
-  const emitRes = await emitClaim.exec();
-  const mayEmit = new Map<string, boolean>();
-  events.forEach((ev, i) => {
-    if (!mayEmit.has(ev.id)) mayEmit.set(ev.id, emitRes?.[i]?.[1] === 'OK');
-  });
-
   // 3. Emit realtime immediately (cheap; keeps live latency off the Dynamo path)
   //    while accumulating batched writes.
   const timelineRows: Record<string, unknown>[] = [];
@@ -99,7 +86,6 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
   let timelineWrites = 0;
   let notifyEnqueued = 0;
   let digestCoalesced = 0;
-  let realtimeEmitted = 0;
 
   for (const ev of events) {
     const members = membersByClub.get(ev.clubId) ?? [];
@@ -127,13 +113,11 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
       materialized += members.length;
     }
 
-    // Only the processing that won the emit-once claim broadcasts the frame, so a
-    // reprocessed event never double-fires the realtime path.
-    if (mayEmit.get(ev.id)) {
-      const thin: ThinPayload = { eventId: ev.id, cursor: ev.id, clubId: ev.clubId, type: ev.type, createdAt: ev.createdAt };
-      emitter.to(`club:${ev.clubId}`).emit('activity', thin);
-      realtimeEmitted += 1;
-    }
+    // At-least-once: a reprocessed event may re-emit the thin frame. That's fine —
+    // the client dedupes by ULID on insert (as does the feed store and the notify
+    // sink), so a redelivered frame never becomes a duplicate feed item.
+    const thin: ThinPayload = { eventId: ev.id, cursor: ev.id, clubId: ev.clubId, type: ev.type, createdAt: ev.createdAt };
+    emitter.to(`club:${ev.clubId}`).emit('activity', thin);
 
     // Notification fan-out, after the preference filter (cheapest reducer: muted
     // clubs / disabled channels never enqueue). Two paths:
@@ -172,7 +156,7 @@ async function handleBatch(events: ActivityEvent[]): Promise<void> {
     digestPipe.length ? digestPipe.exec() : Promise.resolve(),
   ]);
 
-  if (realtimeEmitted) bumpMetric(redis, METRIC.realtimeEmitted, realtimeEmitted);
+  bumpMetric(redis, METRIC.realtimeEmitted, events.length);
   bumpMetric(redis, METRIC.fanned, events.length);
   if (materialized) bumpMetric(redis, METRIC.materialized, materialized);
   if (timelineWrites) bumpMetric(redis, METRIC.timelineWrites, timelineWrites);
